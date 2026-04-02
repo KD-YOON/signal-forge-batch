@@ -1,0 +1,15 @@
+패치 요약
+- Render 패키지 실행 방식(python -m app.jobs auto)에 맞게 import 경로를 전부 app.* 기준으로 수정
+- 수정 파일:
+  - app/jobs.py
+  - app/clients/kis.py
+  - app/clients/naver.py
+  - app/clients/telegram.py
+  - app/services/reporter.py
+
+배포 방법
+1) 압축 해제
+2) 프로젝트 루트에 업로드
+3) Render Command: python -m app.jobs auto
+4) Build Command: pip install -r requirements.txt
+5) 배포 후 Trigger Run 1회 테스트
