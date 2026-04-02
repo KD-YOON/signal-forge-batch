@@ -2,14 +2,14 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 
-from clients.gemini import summarize_news
-from clients.kis import (
+from app.clients.gemini import summarize_news
+from app.clients.kis import (
     enrich_with_indicators,
     get_access_token,
     get_domestic_current_price,
     get_domestic_daily_chart,
 )
-from clients.naver import get_news
+from app.clients.naver import get_news
 
 
 DEFAULT_CANDIDATES = [
