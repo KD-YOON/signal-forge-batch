@@ -10,6 +10,7 @@ from app.clients.kis import (
     get_domestic_daily_chart,
 )
 from app.clients.naver import get_news
+from app.services.signals import analyze_stage_signals
 
 
 DEFAULT_CANDIDATES = [
@@ -36,14 +37,12 @@ def load_candidates() -> list[dict]:
     raw = os.getenv("CANDIDATES_JSON", "").strip()
     if not raw:
         return DEFAULT_CANDIDATES
-
     try:
         data = json.loads(raw)
         if isinstance(data, list) and data:
             return data
     except Exception:
         pass
-
     return DEFAULT_CANDIDATES
 
 
@@ -51,7 +50,6 @@ def resolve_mode(mode: str) -> str:
     mode = str(mode or "").strip().lower()
     if mode in ("lunch", "evening", "manual"):
         return mode
-
     kst = timezone(timedelta(hours=9))
     hour = datetime.now(kst).hour
     return "lunch" if hour < 15 else "evening"
@@ -74,17 +72,11 @@ def evaluate_news_trade_signal(news_items: list[dict], news_summary: str) -> dic
 
     bias = "NEUTRAL"
     score = 0
-    flags: list[str] = []
 
     if positive_hits:
         score += min(12, len(positive_hits) * 4)
-        flags.append("뉴스 호재")
     if negative_hits:
         score -= min(18, len(negative_hits) * 6)
-        flags.append("뉴스 악재")
-
-    if "관련 투자 뉴스 부족" in text:
-        flags.append("뉴스 부족")
 
     if negative_hits:
         bias = "NEGATIVE"
@@ -100,99 +92,15 @@ def evaluate_news_trade_signal(news_items: list[dict], news_summary: str) -> dic
     return {
         "bias": bias,
         "score": score,
-        "flags": flags,
         "positive_hits": positive_hits[:3],
         "negative_hits": negative_hits[:3],
         "keyword_summary": " / ".join(keyword_summary_parts) if keyword_summary_parts else "특이 키워드 없음",
     }
 
 
-def score_item(item: dict, news_signal: dict) -> tuple[int, list[str]]:
-    score = 0
-    reasons = []
-
-    change_pct = float(item.get("change_pct", 0) or 0)
-    vol_rate = float(item.get("vol_rate", 0) or 0)
-    rsi = float(item.get("rsi", 50) or 50)
-
-    if 120 <= vol_rate < 160:
-        score += 20
-        reasons.append("거래량 증가")
-    elif 160 <= vol_rate < 240:
-        score += 26
-        reasons.append("거래량 강세")
-    elif 240 <= vol_rate < 320:
-        score += 10
-        reasons.append("거래량 과열 주의")
-    elif vol_rate >= 320:
-        score -= 8
-        reasons.append("거래량 과열 경계")
-
-    if 48 <= rsi <= 65:
-        score += 26
-        reasons.append("RSI 양호")
-    elif 65 < rsi <= 75:
-        score += 8
-        reasons.append("RSI 높은 편")
-    elif 35 <= rsi < 48:
-        score += 3
-        reasons.append("RSI 보통 이하")
-    elif 25 <= rsi < 35:
-        score -= 10
-        reasons.append("RSI 약세권")
-    elif rsi < 25:
-        score -= 18
-        reasons.append("과매도 경계")
-    elif rsi > 75:
-        score -= 12
-        reasons.append("RSI 과열")
-
-    if 0.3 <= change_pct <= 3.5:
-        score += 24
-        reasons.append("무난한 상승 흐름")
-    elif 3.5 < change_pct <= 6.0:
-        score += 10
-        reasons.append("상승 강도 양호")
-    elif 6.0 < change_pct <= 9.0:
-        score -= 12
-        reasons.append("단기 추격 위험")
-    elif -2.0 <= change_pct < 0.3:
-        score -= 4
-        reasons.append("보합/약세")
-    elif -4.0 <= change_pct < -2.0:
-        score -= 18
-        reasons.append("하락 부담")
-    elif -7.0 <= change_pct < -4.0:
-        score -= 35
-        reasons.append("급락 경계")
-    elif change_pct < -7.0:
-        score -= 60
-        reasons.append("급락 제외 수준")
-
-    theme = str(item.get("theme", "") or "")
-    if "AI" in theme or "반도체" in theme:
-        score += 10
-        reasons.append("테마 우위")
-    elif theme:
-        score += 4
-        reasons.append("테마 보유")
-
-    news_score = int(news_signal.get("score", 0) or 0)
-    score += news_score
-
-    bias = str(news_signal.get("bias", "NEUTRAL"))
-    if bias == "POSITIVE":
-        reasons.append("뉴스 우호적")
-    elif bias == "NEGATIVE":
-        reasons.append("뉴스 부담")
-
-    return score, reasons
-
-
 def build_market_news_summary(items: list[dict]) -> str:
     if not items:
         return "시장 뉴스 포인트 없음"
-
     parts = []
     for row in items[:2]:
         name = str(row.get("name", "")).strip() or str(row.get("code", "")).strip()
@@ -204,7 +112,6 @@ def build_market_news_summary(items: list[dict]) -> str:
 def format_news_lines(news_items: list[dict]) -> list[str]:
     if not news_items:
         return ["- 관련 투자 뉴스 부족"]
-
     lines = []
     for item in news_items[:2]:
         title = _cut(item.get("title", ""), 72)
@@ -218,7 +125,7 @@ def build_report(mode: str) -> str:
     candidates = load_candidates()
 
     token = get_access_token()
-    enriched_items = []
+    analyzed = []
 
     for item in candidates:
         if str(item.get("market", "")).upper() != "KOR":
@@ -230,55 +137,50 @@ def build_report(mode: str) -> str:
 
         quote = get_domestic_current_price(code=code, token=token)
         daily = get_domestic_daily_chart(code=code, token=token, days=30)
-
-        enriched = enrich_with_indicators(
-            {"code": code, "name": name, "theme": theme},
-            quote,
-            daily,
-        )
+        enriched = enrich_with_indicators({"code": code, "name": name, "theme": theme}, quote, daily)
 
         news_items = get_news(name, limit=2)
         news_summary = summarize_news(name, news_items)
         news_signal = evaluate_news_trade_signal(news_items, news_summary)
-        score, reasons = score_item(enriched, news_signal)
 
-        if float(enriched.get("change_pct", 0) or 0) < -7.0:
-            continue
+        stage_info = analyze_stage_signals(enriched, quote, daily, news_signal)
 
-        enriched_items.append(
-            {
-                **enriched,
-                "score": score,
-                "reasons": reasons,
-                "news_items": news_items,
-                "news_summary": news_summary,
-                "news_signal": news_signal,
-            }
-        )
+        analyzed.append({
+            **enriched,
+            **stage_info,
+            "news_items": news_items,
+            "news_summary": news_summary,
+            "news_signal": news_signal,
+        })
 
-    if not enriched_items:
+    if not analyzed:
         return f"📊 Signal Forge 리포트\n모드: {resolved_mode}\n시각: {now}\n\n추천 종목 없음"
 
-    enriched_items.sort(key=lambda x: x["score"], reverse=True)
-    top = enriched_items[0]
-    second = enriched_items[1] if len(enriched_items) > 1 else None
+    analyzed.sort(
+        key=lambda x: (
+            0 if x["entry_decision"] == "ENTRY" else 1 if x["entry_decision"] == "WAIT" else 2,
+            -x["entry_score"],
+            -x["total_score"],
+        )
+    )
+
+    top = analyzed[0]
+    second = analyzed[1] if len(analyzed) > 1 else None
+    market_news = build_market_news_summary(analyzed)
+
+    title_line = "🔥 오늘 최우선 종목"
+    strategy_line = "💡 전략: 제안매수가 근처 접근 후 반등 확인"
+    if resolved_mode == "lunch":
+        title_line = "🔥 점심 체크 종목"
+        strategy_line = "💡 점심 전략: 관심구간 접근 여부와 장중 반등 확인"
+    elif resolved_mode == "evening":
+        title_line = "🔥 저녁 준비 종목"
+        strategy_line = "💡 저녁 전략: 내일 시가와 제안매수가 위치 비교"
 
     top_name = str(top.get("name", "")).strip() or str(top.get("code", "")).strip()
 
-    strategy_line = "💡 전략: 눌림 또는 초반 반등 확인 후 접근"
-    title_line = "🔥 오늘 최우선 종목"
-
-    if resolved_mode == "lunch":
-        strategy_line = "💡 점심 전략: 장중 눌림/반등 체크, 추격 매수는 보수적으로"
-        title_line = "🔥 점심 체크 종목"
-    elif resolved_mode == "evening":
-        strategy_line = "💡 저녁 전략: 내일 시가/초반 흐름 관찰 후 접근"
-        title_line = "🔥 저녁 준비 종목"
-
-    market_news = build_market_news_summary(enriched_items)
-
     lines = [
-        "📊 Signal Forge 리포트 [NEWS+PROMPT PATCH]",
+        "📊 Signal Forge 리포트 [STAGE+ENTRY PATCH]",
         f"모드: {resolved_mode}",
         f"시각: {now}",
         "",
@@ -288,21 +190,28 @@ def build_report(mode: str) -> str:
         f"{top_name} ({top['code']})",
         "",
         f"현재가: {int(top['price']):,}원",
+        f"전일종가 기준 제안매수가: {int(top['proposed_entry']):,}원",
+        f"관심구간: {int(top['entry_zone_low']):,} ~ {int(top['entry_zone_high']):,}원",
+        f"손절가: {int(top['stop_loss']):,}원",
+        f"목표가1: {int(top['target1']):,}원 / 목표가2: {int(top['target2']):,}원",
+        "",
+        f"최종단계: {top['stage']}",
+        f"진입판정: {top['entry_decision']} (진입점수 {top['entry_score']})",
+        f"진입사유: {top['entry_reason']}",
+        "",
         f"등락률: {top['change_pct']}%",
         f"거래량비: {top['vol_rate']}%",
         f"RSI: {top['rsi']}",
-        f"점수: {top['score']}",
+        f"총점: {top['total_score']}",
+        f"매집점수: {top['accumulation_score']} / 돌파점수: {top['breakout_score']} / 리스크점수: {top['risk_score']}",
         f"테마: {top.get('theme', '')}",
         f"뉴스 판정: {top['news_signal']['bias']}",
         f"뉴스 키워드: {top['news_signal']['keyword_summary']}",
         "",
-        "선정 사유:",
-    ]
-
-    for reason in top["reasons"]:
-        lines.append(f"- {reason}")
-
-    lines += [
+        "세부 신호:",
+        f"- 매집: {', '.join(top['accumulation_flags']) if top['accumulation_flags'] else '특이사항 없음'}",
+        f"- 돌파: {', '.join(top['breakout_flags']) if top['breakout_flags'] else '특이사항 없음'}",
+        f"- 리스크: {', '.join(top['risk_flags']) if top['risk_flags'] else '낮음'}",
         "",
         f"📰 최근 기사 요약: {top['news_summary']}",
         "🗞 최근 기사:",
@@ -314,12 +223,13 @@ def build_report(mode: str) -> str:
         lines += [
             "",
             "➕ 차순위 후보",
-            f"{second_name} ({second['code']}) / 점수 {second['score']}",
-            f"뉴스 판정: {second['news_signal']['bias']} / 요약: {second['news_summary']}",
+            f"{second_name} ({second['code']}) / 단계 {second['stage']} / 진입판정 {second['entry_decision']}",
+            f"제안매수가 {int(second['proposed_entry']):,}원 / 점수 {second['entry_score']}",
         ]
 
     lines += [
         "",
+        "제외 기준: 과열 추격, 부정 뉴스, 리스크 과다 종목은 PASS 처리 가능",
         strategy_line,
     ]
 
