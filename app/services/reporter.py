@@ -242,7 +242,6 @@ def build_report(mode: str) -> str:
         news_signal = evaluate_news_trade_signal(news_items, news_summary)
         score, reasons = score_item(enriched, news_signal)
 
-        # 너무 급한 급락주는 추천 후보에서 제외
         if float(enriched.get("change_pct", 0) or 0) < -7.0:
             continue
 
@@ -279,7 +278,7 @@ def build_report(mode: str) -> str:
     market_news = build_market_news_summary(enriched_items)
 
     lines = [
-        "📊 Signal Forge 리포트",
+        "📊 Signal Forge 리포트 [NEWS+PROMPT PATCH]",
         f"모드: {resolved_mode}",
         f"시각: {now}",
         "",
