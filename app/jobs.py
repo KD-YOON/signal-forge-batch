@@ -1,5 +1,5 @@
-from app.clients.telegram import send_telegram
-from app.services.reporter import build_report
+from clients.telegram import send_telegram
+from services.reporter import build_report
 
 
 def main():
