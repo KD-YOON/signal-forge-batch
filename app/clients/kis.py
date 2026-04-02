@@ -1,7 +1,7 @@
 import os
 from datetime import datetime
 from statistics import mean
-from utils import request_with_retry
+from app.utils import request_with_retry
 
 DEFAULT_BASE_URL = "https://openapi.koreainvestment.com:9443"
 
