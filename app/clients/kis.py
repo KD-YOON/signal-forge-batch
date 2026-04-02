@@ -69,6 +69,12 @@ def get_domestic_current_price(code: str, token: str | None = None) -> dict:
     data = resp.json()
     out = data.get("output", {})
 
+    kis_name = (
+        str(out.get("hts_kor_isnm", "") or "").strip()
+        or str(out.get("prdt_name", "") or "").strip()
+        or str(out.get("bstp_kor_isnm", "") or "").strip()
+    )
+
     return {
         "code": _normalize_code(code),
         "price": float(out.get("stck_prpr", 0) or 0),
@@ -77,7 +83,7 @@ def get_domestic_current_price(code: str, token: str | None = None) -> dict:
         "low": float(out.get("stck_lwpr", 0) or 0),
         "change_pct": float(out.get("prdy_ctrt", 0) or 0),
         "volume": float(out.get("acml_vol", 0) or 0),
-        "name": str(out.get("hts_kor_isnm", "")).strip(),
+        "kis_name": kis_name,
     }
 
 
@@ -159,9 +165,16 @@ def enrich_with_indicators(item: dict, quote: dict, daily: list[dict]) -> dict:
     current_vol = float(quote.get("volume", 0) or 0)
     vol_rate = (current_vol / avg_vol_20 * 100) if avg_vol_20 > 0 else 0.0
 
+    merged_name = (
+        str(item.get("name", "")).strip()
+        or str(quote.get("kis_name", "")).strip()
+        or str(item.get("code", "")).strip()
+    )
+
     return {
         **item,
         **quote,
+        "name": merged_name,
         "rsi": round(rsi, 1),
         "vol_rate": round(vol_rate, 1),
     }
