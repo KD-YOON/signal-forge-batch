@@ -1,7 +1,6 @@
 import os
 import re
-from utils import request_with_retry
-
+from app.utils import request_with_retry
 BAD_KEYWORDS = [
     "교육지원청", "지원청", "교육청", "학교", "학생", "교사", "공무원",
     "채용", "행사", "센터", "협약", "복지", "문화원", "박람회", "도서관",
