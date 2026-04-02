@@ -1,5 +1,5 @@
 import os
-from utils import request_with_retry
+from app.utils import request_with_retry
 
 
 def send_telegram(text: str) -> str:
