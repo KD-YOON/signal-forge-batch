@@ -125,13 +125,15 @@ def build_report(mode: str) -> str:
     enriched_items.sort(key=lambda x: x["score"], reverse=True)
     top = enriched_items[0]
 
+    top_name = str(top.get("name", "")).strip() or str(top.get("code", "")).strip()
+
     lines = [
         "📊 Signal Forge 리포트",
         f"모드: {mode}",
         f"시각: {now}",
         "",
         "🔥 오늘 최우선 종목",
-        f"{top['name']} ({top['code']})",
+        f"{top_name} ({top['code']})",
         "",
         f"현재가: {int(top['price']):,}원",
         f"등락률: {top['change_pct']}%",
