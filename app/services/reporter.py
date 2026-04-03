@@ -17,6 +17,8 @@ from app.services.signals import (
     decide_stage_label,
 )
 
+from app.recent_cache import get_recent_tickers, add_recommendations
+
 
 POSITIVE_NEWS_KEYWORDS = [
     "수주", "계약", "공급", "양산", "실적 개선", "실적개선", "흑자전환",
