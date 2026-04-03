@@ -98,7 +98,7 @@ def _set_cached_token(token: str, expires_in: int) -> None:
     global _TOKEN_CACHE
 
     if expires_in <= 0:
-        expires_in = 60 * 60 * 6  # 비정상 응답 대비 보수적 기본값 6시간
+        expires_in = 60 * 60 * 6  # 비정상 응답 대비 기본 6시간
 
     expires_at = time.time() + expires_in
 
@@ -110,7 +110,7 @@ def _set_cached_token(token: str, expires_in: int) -> None:
 def get_access_token(force_refresh: bool = False) -> str:
     """
     토큰 요청은 상태코드보다 응답 body를 먼저 확인한다.
-    또한 파일 캐시를 사용해 실행 간 재사용을 시도한다.
+    파일 캐시를 사용해 실행 간 재사용을 시도한다.
     """
     if not force_refresh:
         cached_token = _get_valid_cached_token(buffer_sec=300)
