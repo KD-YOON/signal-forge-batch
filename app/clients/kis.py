@@ -11,7 +11,7 @@ import requests
 from app.utils import request_with_retry
 
 DEFAULT_BASE_URL = "https://openapi.koreainvestment.com:9443"
-TOKEN_CACHE_FILE = "kis_token_cache.json"
+DEFAULT_TOKEN_CACHE_FILE = "kis_token_cache.json"
 
 # 실행 프로세스 내 캐시
 _TOKEN_CACHE = {
@@ -27,19 +27,53 @@ def _get_env(name: str, required: bool = True, default: str = "") -> str:
     return value
 
 
-def _parse_expiry_seconds(data: dict) -> int:
+def _safe_int(value, default: int = 0) -> int:
     try:
-        return int(float(data.get("expires_in", 0) or 0))
+        return int(float(value))
     except Exception:
+        return int(default)
+
+
+def _token_cache_file() -> str:
+    """
+    환경변수로 캐시 파일 경로를 지정할 수 있게 함.
+    미지정 시 프로젝트 루트 기준 kis_token_cache.json 사용.
+    """
+    return os.getenv("KIS_TOKEN_CACHE_FILE", DEFAULT_TOKEN_CACHE_FILE).strip() or DEFAULT_TOKEN_CACHE_FILE
+
+
+def _parse_expiry_seconds(data: dict) -> int:
+    """
+    KIS 응답에서 expires_in(초) 또는 access_token_token_expired(시각)를 이용해 남은 초를 계산.
+    """
+    if not isinstance(data, dict):
         return 0
+
+    expires_in = _safe_int(data.get("expires_in", 0), 0)
+    if expires_in > 0:
+        return expires_in
+
+    expired_at_raw = str(data.get("access_token_token_expired", "") or "").strip()
+    if expired_at_raw:
+        # 예: 2026-04-04 15:37:55
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y%m%d%H%M%S"):
+            try:
+                dt = datetime.strptime(expired_at_raw, fmt)
+                remain = int(dt.timestamp() - time.time())
+                return max(0, remain)
+            except Exception:
+                continue
+
+    return 0
 
 
 def _load_token_cache_file() -> dict:
-    if not os.path.exists(TOKEN_CACHE_FILE):
+    path = _token_cache_file()
+    if not os.path.exists(path):
         return {}
 
     try:
-        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
             if isinstance(data, dict):
                 return data
@@ -50,20 +84,31 @@ def _load_token_cache_file() -> dict:
 
 
 def _save_token_cache_file(token: str, expires_at: float) -> None:
+    path = _token_cache_file()
     payload = {
         "access_token": token,
-        "expires_at": expires_at,
+        "expires_at": float(expires_at),
         "saved_at": time.time(),
     }
 
     try:
-        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
     except Exception as e:
         print("[KIS DEBUG] token cache save failed", str(e))
 
 
-def _get_valid_cached_token(buffer_sec: int = 300) -> str:
+def _is_token_usable(token: str, expires_at: float, buffer_sec: int = 1800) -> bool:
+    """
+    buffer_sec 이내 만료 예정이면 재발급 대상으로 본다.
+    기본 30분 버퍼.
+    """
+    if not token or not expires_at:
+        return False
+    return float(expires_at) > time.time() + max(0, int(buffer_sec))
+
+
+def _get_valid_cached_token(buffer_sec: int = 1800) -> str:
     """
     1) 메모리 캐시 확인
     2) 파일 캐시 확인
@@ -71,12 +116,10 @@ def _get_valid_cached_token(buffer_sec: int = 300) -> str:
     """
     global _TOKEN_CACHE
 
-    now_ts = time.time()
-
     # 1. 메모리 캐시
     mem_token = str(_TOKEN_CACHE.get("token", "") or "").strip()
     mem_exp = float(_TOKEN_CACHE.get("expires_at", 0) or 0)
-    if mem_token and mem_exp > now_ts + buffer_sec:
+    if _is_token_usable(mem_token, mem_exp, buffer_sec=buffer_sec):
         print("[KIS DEBUG] token source = memory_cache")
         return mem_token
 
@@ -84,8 +127,7 @@ def _get_valid_cached_token(buffer_sec: int = 300) -> str:
     cached = _load_token_cache_file()
     file_token = str(cached.get("access_token", "") or "").strip()
     file_exp = float(cached.get("expires_at", 0) or 0)
-
-    if file_token and file_exp > now_ts + buffer_sec:
+    if _is_token_usable(file_token, file_exp, buffer_sec=buffer_sec):
         _TOKEN_CACHE["token"] = file_token
         _TOKEN_CACHE["expires_at"] = file_exp
         print("[KIS DEBUG] token source = file_cache")
@@ -98,22 +140,41 @@ def _set_cached_token(token: str, expires_in: int) -> None:
     global _TOKEN_CACHE
 
     if expires_in <= 0:
-        expires_in = 60 * 60 * 6  # 비정상 응답 대비 기본 6시간
+        # 비정상 응답 대비 기본 6시간
+        expires_in = 60 * 60 * 6
 
-    expires_at = time.time() + expires_in
+    expires_at = time.time() + int(expires_in)
 
     _TOKEN_CACHE["token"] = token
     _TOKEN_CACHE["expires_at"] = expires_at
     _save_token_cache_file(token, expires_at)
 
 
+def clear_cached_token() -> None:
+    """
+    수동 점검용. 필요 시 강제 초기화에 사용.
+    """
+    global _TOKEN_CACHE
+    _TOKEN_CACHE["token"] = ""
+    _TOKEN_CACHE["expires_at"] = 0.0
+
+    path = _token_cache_file()
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        print("[KIS DEBUG] token cache clear failed", str(e))
+
+
 def get_access_token(force_refresh: bool = False) -> str:
     """
-    토큰 요청은 상태코드보다 응답 body를 먼저 확인한다.
-    파일 캐시를 사용해 실행 간 재사용을 시도한다.
+    원칙:
+    - force_refresh=False 이면 캐시 우선
+    - 살아있는 토큰이 있으면 절대 재발급하지 않음
+    - 응답 body 에서 토큰을 확인하고 expires_in / access_token_token_expired 기준으로 저장
     """
     if not force_refresh:
-        cached_token = _get_valid_cached_token(buffer_sec=300)
+        cached_token = _get_valid_cached_token(buffer_sec=_safe_int(os.getenv("KIS_TOKEN_BUFFER_SEC", "1800"), 1800))
         if cached_token:
             return cached_token
 
@@ -135,6 +196,7 @@ def get_access_token(force_refresh: bool = False) -> str:
             "app_key_prefix": app_key[:6] if app_key else "",
             "app_secret_prefix": app_secret[:6] if app_secret else "",
             "force_refresh": force_refresh,
+            "cache_file": _token_cache_file(),
         },
     )
 
@@ -145,17 +207,16 @@ def get_access_token(force_refresh: bool = False) -> str:
             resp = requests.post(url, json=payload, timeout=30)
 
             print("[KIS DEBUG] token status", resp.status_code)
-            print("[KIS DEBUG] token raw body", (resp.text or "")[:500])
 
             try:
                 data = resp.json()
             except Exception:
                 data = {}
 
-            print(
-                "[KIS DEBUG] token response keys",
-                list(data.keys()) if isinstance(data, dict) else type(data),
-            )
+            if isinstance(data, dict):
+                print("[KIS DEBUG] token response keys", list(data.keys()))
+            else:
+                print("[KIS DEBUG] token response type", type(data).__name__)
 
             token = data.get("access_token", "") if isinstance(data, dict) else ""
             if token:
@@ -164,12 +225,11 @@ def get_access_token(force_refresh: bool = False) -> str:
                 print("[KIS DEBUG] token source = issued_new")
                 return token
 
+            body_preview = (resp.text or "")[:300]
             if resp.status_code >= 400:
-                last_error = RuntimeError(
-                    f"KIS token HTTP {resp.status_code}: {(resp.text or '')[:300]}"
-                )
+                last_error = RuntimeError(f"KIS token HTTP {resp.status_code}: {body_preview}")
             else:
-                last_error = RuntimeError(f"KIS token error: {data}")
+                last_error = RuntimeError(f"KIS token error: {body_preview}")
 
         except Exception as e:
             last_error = e
