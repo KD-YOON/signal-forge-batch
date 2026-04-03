@@ -7,11 +7,29 @@ def _safe_float(value, default=0.0):
         return default
 
 
+def _as_dict(value):
+    if value is None:
+        return {}
+
+    if isinstance(value, dict):
+        return value
+
+    if hasattr(value, "to_dict"):
+        try:
+            converted = value.to_dict()
+            if isinstance(converted, dict):
+                return converted
+        except Exception:
+            pass
+
+    return {}
+
+
 def _normalize_item(item: dict, quote: dict = None, daily: dict = None, news_signal: dict = None) -> dict:
-    item = dict(item or {})
-    quote = dict(quote or {})
-    daily = dict(daily or {})
-    news_signal = dict(news_signal or {})
+    item = _as_dict(item)
+    quote = _as_dict(quote)
+    daily = _as_dict(daily)
+    news_signal = _as_dict(news_signal)
 
     merged = {}
     merged.update(daily)
@@ -19,10 +37,21 @@ def _normalize_item(item: dict, quote: dict = None, daily: dict = None, news_sig
     merged.update(item)
 
     if "price" not in merged:
-        merged["price"] = quote.get("price") or item.get("price") or item.get("close") or daily.get("close") or 0
+        merged["price"] = (
+            quote.get("price")
+            or item.get("price")
+            or item.get("close")
+            or daily.get("close")
+            or 0
+        )
 
     if "prev_close" not in merged:
-        merged["prev_close"] = quote.get("prev_close") or item.get("prev_close") or daily.get("prev_close") or 0
+        merged["prev_close"] = (
+            quote.get("prev_close")
+            or item.get("prev_close")
+            or daily.get("prev_close")
+            or 0
+        )
 
     if "change_pct" not in merged:
         price = _safe_float(merged.get("price"), 0)
@@ -58,7 +87,7 @@ def _normalize_item(item: dict, quote: dict = None, daily: dict = None, news_sig
     return merged
 
 
-def _classify_stage(item: dict) -> tuple[str, list]:
+def _classify_stage(item: dict):
     rsi = _safe_float(item.get("rsi", 50), 50)
     change_pct = _safe_float(item.get("change_pct", 0), 0)
     vol_rate = _safe_float(item.get("vol_rate", 0), 0)
