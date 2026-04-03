@@ -68,10 +68,16 @@ def _parse_json_array_from_text(text: str) -> list[dict] | None:
     return None
 
 
-def build_news_summary_prompt(stock_name: str, news_items: list[dict]) -> str:
+def _market_label(market: str) -> str:
+    return "미국 주식" if str(market or "KOR").upper().strip() == "US" else "한국 주식"
+
+
+def build_news_summary_prompt(stock_name: str, news_items: list[dict], market: str = "KOR") -> str:
+    market_label = _market_label(market)
     prompt_lines = [
-        "너는 한국 주식 단기매매용 뉴스 필터 분석기다.",
+        f"너는 {market_label} 단기매매용 뉴스 필터 분석기다.",
         f"종목명: {stock_name}",
+        f"시장: {str(market or 'KOR').upper().strip()}",
         "",
         "[목표]",
         "입력된 기사 중 주가에 직접 영향을 줄 수 있는 투자 정보만 골라 1문장으로 요약한다.",
@@ -79,15 +85,15 @@ def build_news_summary_prompt(stock_name: str, news_items: list[dict]) -> str:
         "[반드시 지킬 규칙]",
         "1. 현재 시세를 추정하거나 만들어 쓰지 마라.",
         "2. 기사 내용에 없는 숫자·등락률·날짜를 임의로 쓰지 마라.",
-        "3. 교육, 공공기관, 행사, 채용, 홍보성 기사, 일반 사회뉴스는 무시하라.",
-        "4. 실적, 수주, 공급, 계약, 가이던스, 증권사 리포트, 투자심리, 정책 수혜만 반영하라.",
+        "3. 홍보성 기사, 일반 사회뉴스, 생활정보성 기사, 기업 무관 잡음은 무시하라.",
+        "4. 실적, 가이던스, 수주, 공급, 계약, 증권사 평가, 투자심리, 정책/규제 수혜만 반영하라.",
         "5. 기사들이 서로 애매하거나 투자 정보가 약하면 정확히 '관련 투자 뉴스 부족'이라고 답하라.",
         "6. 한 문장, 70자 안팎, 존댓말 없이 간결하게 써라.",
         "7. 출력은 문장 1개만, 불릿/번호/설명 추가 금지.",
         "",
         "[좋은 출력 예시]",
         "AI 서버용 반도체 수요 기대와 증권사 긍정 평가가 투자심리를 지지",
-        "대규모 공급계약과 실적 개선 기대가 주가 모멘텀 요인으로 부각",
+        "실적 발표 기대와 가이던스 개선 전망이 단기 모멘텀으로 부각",
         "관련 투자 뉴스 부족",
         "",
         "[기사 목록]",
@@ -100,7 +106,7 @@ def build_news_summary_prompt(stock_name: str, news_items: list[dict]) -> str:
     return "\n".join(prompt_lines)
 
 
-def summarize_news(stock_name: str, news_items: list[dict]) -> str:
+def summarize_news(stock_name: str, news_items: list[dict], market: str = "KOR") -> str:
     api_key = _get_api_key()
 
     if not news_items:
@@ -110,17 +116,9 @@ def summarize_news(stock_name: str, news_items: list[dict]) -> str:
         titles = [x.get("title", "").strip() for x in news_items[:2] if x.get("title")]
         return " / ".join(titles) if titles else "관련 투자 뉴스 부족"
 
-    prompt = build_news_summary_prompt(stock_name, news_items)
+    prompt = build_news_summary_prompt(stock_name, news_items, market=market)
 
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt}
-                ]
-            }
-        ]
-    }
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
     try:
         data = _call_gemini(payload, model=DEFAULT_MODEL, timeout=30.0)
@@ -147,13 +145,16 @@ def build_candidate_review_prompt(
     macro_summary: str,
 ) -> str:
     lightweight_rows = []
+    markets = set()
     for r in rows:
+        market = str(r.get("market", "KOR")).upper().strip()
+        markets.add(market)
         lightweight_rows.append(
             {
                 "code": str(r.get("code", "")),
                 "name": str(r.get("name", "")),
                 "source": str(r.get("candidate_source", "")),
-                "market": str(r.get("market", "KOR")),
+                "market": market,
                 "theme": str(r.get("theme", "")),
                 "price": float(r.get("price", 0) or 0),
                 "changePct": float(r.get("change_pct", 0) or 0),
@@ -177,15 +178,17 @@ def build_candidate_review_prompt(
             }
         )
 
+    market_scope = "혼합 시장" if len(markets) > 1 else ("미국 주식시장" if "US" in markets else "한국 주식시장")
+
     return (
         f"[실행구분]\n{run_type}\n\n"
         f"[시장요약]\n{market_news_summary}\n\n"
         f"[매크로요약]\n{macro_summary}\n\n"
-        "너는 한국 주식시장 단기매매용 수석 애널리스트다.\n"
+        f"너는 {market_scope} 단기매매용 수석 애널리스트다.\n"
         "역할은 단순 요약이 아니라 후보 종목들을 비교해 최종 매매 적합도를 보수적으로 판정하는 것이다.\n\n"
         "[최우선 원칙]\n"
         "1. 하드필터 탈락 종목은 PASS 우선이다.\n"
-        "2. 초저가, 테마 과열, 인버스/레버리지, 급등 추격형은 매우 보수적으로 본다.\n"
+        "2. 초저가, 과열 테마, 급등 추격형은 매우 보수적으로 본다.\n"
         "3. 뉴스만 좋고 차트 근거가 약한 종목은 과대평가 금지.\n"
         "4. totalScore, qualityScore, riskScore, entryDecision을 함께 보라.\n"
         "5. 판단이 애매하면 WATCH 또는 PASS로 보수 판정하라.\n"
@@ -216,15 +219,7 @@ def review_candidates_with_gemini(
         macro_summary=macro_summary,
     )
 
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt}
-                ]
-            }
-        ]
-    }
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
     try:
         data = _call_gemini(payload, model=DEFAULT_MODEL, timeout=60.0)
@@ -256,19 +251,14 @@ def review_candidates_with_gemini(
         except Exception:
             confidence = 50
 
-        new_row = {
-            **r,
-            "final_stage": final_signal,
-            "ai_verdict": ai_verdict or str(r.get("entry_reason", "")),
-            "ai_risk": ai_risk or ", ".join(r.get("hard_filter_reasons", []) or []),
-            "ai_confidence": max(0, min(confidence, 100)),
-        }
-
-        if final_signal == "PASS":
-            new_row["entry_decision"] = "PASS"
-            if ai_risk:
-                new_row["entry_reason"] = ai_risk
-
-        out.append(new_row)
+        out.append(
+            {
+                **r,
+                "final_stage": final_signal,
+                "ai_verdict": ai_verdict,
+                "ai_risk": ai_risk,
+                "ai_confidence": max(0, min(100, confidence)),
+            }
+        )
 
     return out
