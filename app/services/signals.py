@@ -1,10 +1,10 @@
 def _safe_float(value, default=0.0):
     try:
         if value is None or value == "":
-            return float(default)
+            return default
         return float(value)
     except Exception:
-        return float(default)
+        return default
 
 
 def _as_dict(value):
