@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import os
+import time
 from datetime import datetime
 from statistics import mean
+
+import requests
 
 from app.utils import request_with_retry
 
 DEFAULT_BASE_URL = "https://openapi.koreainvestment.com:9443"
+
+# 실행 프로세스 내 간단 캐시
+_TOKEN_CACHE = {
+    "token": "",
+    "expires_at": 0.0,  # epoch seconds
+}
 
 
 def _get_env(name: str, required: bool = True, default: str = "") -> str:
@@ -16,7 +25,35 @@ def _get_env(name: str, required: bool = True, default: str = "") -> str:
     return value
 
 
-def get_access_token() -> str:
+def _parse_expiry_seconds(data: dict) -> int:
+    """
+    KIS 응답의 expires_in을 안전하게 파싱
+    """
+    try:
+        return int(float(data.get("expires_in", 0) or 0))
+    except Exception:
+        return 0
+
+
+def get_access_token(force_refresh: bool = False) -> str:
+    """
+    토큰 요청은 공통 request_with_retry를 그대로 쓰지 않고 별도 처리한다.
+    이유:
+    - 403이어도 응답 body를 먼저 확인해야 하는 경우가 있음
+    - access_token이 body에 들어오면 상태코드보다 실사용 가능성이 더 중요함
+    """
+    global _TOKEN_CACHE
+
+    now_ts = time.time()
+
+    # 만료 60초 전까지는 재사용
+    if (
+        not force_refresh
+        and _TOKEN_CACHE["token"]
+        and _TOKEN_CACHE["expires_at"] > now_ts + 60
+    ):
+        return _TOKEN_CACHE["token"]
+
     app_key = _get_env("KIS_APP_KEY")
     app_secret = _get_env("KIS_APP_SECRET")
     base_url = _get_env("KIS_BASE_URL", required=False, default=DEFAULT_BASE_URL)
@@ -37,15 +74,50 @@ def get_access_token() -> str:
         },
     )
 
-    resp = request_with_retry("POST", url, json=payload)
-    data = resp.json()
+    last_error = None
 
-    print("[KIS DEBUG] token response keys", list(data.keys()) if isinstance(data, dict) else type(data))
+    for i in range(3):
+        try:
+            resp = requests.post(url, json=payload, timeout=30)
 
-    token = data.get("access_token", "")
-    if not token:
-        raise RuntimeError(f"KIS token error: {data}")
-    return token
+            print("[KIS DEBUG] token status", resp.status_code)
+            print("[KIS DEBUG] token raw body", (resp.text or "")[:500])
+
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+
+            print(
+                "[KIS DEBUG] token response keys",
+                list(data.keys()) if isinstance(data, dict) else type(data),
+            )
+
+            token = data.get("access_token", "") if isinstance(data, dict) else ""
+            if token:
+                expires_in = _parse_expiry_seconds(data)
+                if expires_in <= 0:
+                    expires_in = 60 * 60 * 6  # 비정상 응답 대비 보수적 기본값 6시간
+
+                _TOKEN_CACHE["token"] = token
+                _TOKEN_CACHE["expires_at"] = time.time() + expires_in
+                return token
+
+            # body에 token이 없으면 그때 상태코드와 본문 기반으로 실패 처리
+            if resp.status_code >= 400:
+                last_error = RuntimeError(
+                    f"KIS token HTTP {resp.status_code}: {(resp.text or '')[:300]}"
+                )
+            else:
+                last_error = RuntimeError(f"KIS token error: {data}")
+
+        except Exception as e:
+            last_error = e
+
+        if i < 2:
+            time.sleep(i + 1)
+
+    raise last_error
 
 
 def _headers(token: str, tr_id: str) -> dict:
@@ -142,7 +214,7 @@ def get_domestic_daily_chart(code: str, token: str, days: int = 30) -> list[dict
 
 def get_domestic_volume_rank_candidates(token: str, limit: int = 40) -> list[dict]:
     """
-    Apps Script의 getDomesticVolumeRankCandidates_() 역할을 Python으로 옮긴 버전
+    거래량 랭킹 후보 조회
     """
     base_url = _get_env("KIS_BASE_URL", required=False, default=DEFAULT_BASE_URL)
     url = f"{base_url}/uapi/domestic-stock/v1/quotations/volume-rank"
@@ -234,51 +306,3 @@ def enrich_with_indicators(item: dict, quote: dict, daily: list[dict]) -> dict:
         "rsi": round(rsi, 1),
         "vol_rate": round(vol_rate, 1),
     }
-
-
-# === app/clients/kis.py ADD START ===
-def get_domestic_volume_rank_candidates(token: str, limit: int = 40) -> list[dict]:
-    """
-    Apps Script의 getDomesticVolumeRankCandidates_() 역할
-    """
-    base_url = _get_env("KIS_BASE_URL", required=False, default=DEFAULT_BASE_URL)
-    url = f"{base_url}/uapi/domestic-stock/v1/quotations/volume-rank"
-    params = {
-        "FID_COND_MRKT_DIV_CODE": "J",
-        "FID_COND_SCR_DIV_CODE": "20171",
-        "FID_INPUT_ISCD": "0000",
-        "FID_DIV_CLS_CODE": "0",
-        "FID_BLNG_CLS_CODE": "0",
-        "FID_TRGT_CLS_CODE": "111111111",
-        "FID_TRGT_EXLS_CLS_CODE": "000000",
-    }
-
-    resp = request_with_retry(
-        "GET",
-        url,
-        headers=_headers(token, "FHPST01710000"),
-        params=params,
-    )
-    data = resp.json()
-    rows = data.get("output", [])[: max(1, min(limit, 100))]
-
-    out = []
-    for idx, row in enumerate(rows, start=1):
-        code = _normalize_code(row.get("mksc_shrn_iscd", ""))
-        name = str(row.get("hts_kor_isnm", "") or "").strip()
-        if not code or not name:
-            continue
-
-        out.append(
-            {
-                "market": "KOR",
-                "code": code,
-                "name": name,
-                "theme": "",
-                "source": "VOLUME_RANK",
-                "rank": idx,
-                "memo": "",
-            }
-        )
-    return out
-# === app/clients/kis.py ADD END ===
