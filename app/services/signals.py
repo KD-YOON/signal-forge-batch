@@ -10,6 +10,15 @@ def _safe_float(value, default=0.0):
         return default
 
 
+def _safe_int(value, default=0):
+    try:
+        if value is None or value == "":
+            return default
+        return int(round(float(value)))
+    except Exception:
+        return default
+
+
 def _as_dict(value):
     if value is None:
         return {}
@@ -108,17 +117,23 @@ def _normalize_item(item=None, quote=None, daily=None, news_signal=None):
     recent_low_20 = min(lows[:20]) if lows[:20] else low
     avg_vol_20 = sum(volumes[:20]) / len(volumes[:20]) if volumes[:20] else 0
 
-    change_pct = _safe_float(merged.get("change_pct"), default=None)
-    if change_pct is None:
+    change_pct = merged.get("change_pct")
+    if change_pct is None or change_pct == "":
         change_pct = ((price - prev_close) / prev_close) * 100 if prev_close > 0 else 0
+    else:
+        change_pct = _safe_float(change_pct, 0)
 
-    vol_rate = _safe_float(merged.get("vol_rate"), default=None)
-    if vol_rate is None:
+    vol_rate = merged.get("vol_rate")
+    if vol_rate is None or vol_rate == "":
         vol_rate = (volume / avg_vol_20 * 100) if avg_vol_20 > 0 else 0
+    else:
+        vol_rate = _safe_float(vol_rate, 0)
 
-    rebound_from_low = _safe_float(merged.get("rebound_from_low"), default=None)
-    if rebound_from_low is None:
+    rebound_from_low = merged.get("rebound_from_low")
+    if rebound_from_low is None or rebound_from_low == "":
         rebound_from_low = ((price - recent_low_20) / recent_low_20) * 100 if recent_low_20 > 0 else 0
+    else:
+        rebound_from_low = _safe_float(rebound_from_low, 0)
 
     news_score = _safe_float(
         news_signal.get("score")
@@ -154,7 +169,6 @@ def _normalize_item(item=None, quote=None, daily=None, news_signal=None):
 def _build_component_scores(item):
     rsi = _safe_float(item.get("rsi"), 50)
     price = _safe_float(item.get("price"), 0)
-    prev_close = _safe_float(item.get("prev_close"), 0)
     change_pct = _safe_float(item.get("change_pct"), 0)
     vol_rate = _safe_float(item.get("vol_rate"), 0)
     rebound = _safe_float(item.get("rebound_from_low"), 0)
@@ -248,8 +262,6 @@ def _build_component_scores(item):
         risk_score += 6
         risk_flags.append("급락추세")
 
-    # 뉴스 점수 스케일 현실화
-    # reporter.py 쪽 score는 대체로 -18 ~ +12 범위에 가까움
     if news_bias == "POSITIVE":
         if news_score >= 10:
             sentiment_adj += 10
@@ -293,11 +305,6 @@ def _build_component_scores(item):
         risk_score += 8
         risk_flags.append("과열거래량")
 
-    gap_pct = ((price - prev_close) / prev_close) * 100 if prev_close > 0 else 0
-    if gap_pct >= 5:
-        risk_score += 4
-        risk_flags.append("갭상승과다")
-
     accumulation_score = int(_clamp(round(accumulation_score), 0, 30))
     breakout_score = int(_clamp(round(breakout_score), 0, 30))
     theme_score = int(_clamp(round(theme_score), 0, 15))
@@ -314,6 +321,46 @@ def _build_component_scores(item):
         "breakout_flags": breakout_flags,
         "risk_flags": risk_flags,
         "trend_flags": trend_flags,
+    }
+
+
+def _hard_symbol_filter(item):
+    name = str(item.get("name", "") or "").strip()
+    market = str(item.get("market", "KOR") or "KOR").upper().strip()
+
+    price = _safe_float(item.get("price"), 0)
+    change_pct = _safe_float(item.get("change_pct"), 0)
+    vol_rate = _safe_float(item.get("vol_rate"), 0)
+    risk_score = _safe_float(item.get("risk_score"), 0)
+
+    ban_keywords = [
+        "인버스", "레버리지", "etn", "선물", "코스닥150선물",
+        "원유", "유전", "2x", "3x"
+    ]
+
+    reasons = []
+
+    if market == "KOR" and price > 0 and price < 1000:
+        reasons.append("초저가종목")
+
+    lowered_name = name.lower()
+    for kw in ban_keywords:
+        if kw.lower() in lowered_name:
+            reasons.append(f"제외키워드:{kw}")
+            break
+
+    if change_pct >= 15:
+        reasons.append("당일급등과다")
+
+    if vol_rate >= 350:
+        reasons.append("거래량과열")
+
+    if risk_score >= 22:
+        reasons.append("리스크과다")
+
+    return {
+        "passed": len(reasons) == 0,
+        "reasons": reasons,
     }
 
 
@@ -608,7 +655,6 @@ def _decide_entry_timing(item, comp, total_score, quality_score, stage):
     sentiment_score = _safe_float(item.get("news_score"), 0)
     news_bias = str(item.get("news_bias", "NEUTRAL")).upper().strip()
 
-    # 현실적인 감성 강도 분기
     positive_strong = sentiment_score >= 10
     positive_mid = sentiment_score >= 6
     positive_light = sentiment_score >= 3
@@ -845,6 +891,20 @@ def analyze_stage_signals(item, quote=None, daily=None, news_signal=None):
     entry_timing = _decide_entry_timing(normalized, comp, total_score, quality_score, stage)
     entry_plan = _build_entry_plan(normalized)
 
+    hard_filter = _hard_symbol_filter({**normalized, **comp})
+    hard_filter_passed = bool(hard_filter["passed"])
+    hard_filter_reasons = hard_filter["reasons"]
+
+    if not hard_filter_passed:
+        stage = "PASS"
+        entry_timing = {
+            "entry_decision": "PASS",
+            "entry_reason": " / ".join(hard_filter_reasons),
+            "entry_score": min(_safe_int(entry_timing.get("entry_score", 0)), 35),
+        }
+        quality_flags = list(quality_flags) + hard_filter_reasons
+        pass_quality = False
+
     accumulation_flags = comp["accumulation_flags"] + comp["trend_flags"]
 
     return {
@@ -857,6 +917,8 @@ def analyze_stage_signals(item, quote=None, daily=None, news_signal=None):
         "quality_score": int(quality_score),
         "quality_flags": quality_flags,
         "pass_quality": pass_quality,
+        "hard_filter_passed": hard_filter_passed,
+        "hard_filter_reasons": hard_filter_reasons,
         "accumulation_score": comp["accumulation_score"],
         "breakout_score": comp["breakout_score"],
         "theme_score": comp["theme_score"],
