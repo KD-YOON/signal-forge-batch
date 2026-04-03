@@ -75,7 +75,7 @@ def _market_label(market: str) -> str:
 def build_news_summary_prompt(stock_name: str, news_items: list[dict], market: str = "KOR") -> str:
     market_label = _market_label(market)
     prompt_lines = [
-        f"너는 {market_label} 단기매매용 뉴스 필터 분석기다.",
+        f"너는 {market_label} 매매판단용 뉴스 필터 분석기다.",
         f"종목명: {stock_name}",
         f"시장: {str(market or 'KOR').upper().strip()}",
         "",
@@ -184,7 +184,7 @@ def build_candidate_review_prompt(
         f"[실행구분]\n{run_type}\n\n"
         f"[시장요약]\n{market_news_summary}\n\n"
         f"[매크로요약]\n{macro_summary}\n\n"
-        f"너는 {market_scope} 단기매매용 수석 애널리스트다.\n"
+        f"너는 {market_scope} 스윙, 단기 진입판단 보조 수석 애널리스트다.\n"
         "역할은 단순 요약이 아니라 후보 종목들을 비교해 최종 매매 적합도를 보수적으로 판정하는 것이다.\n\n"
         "[최우선 원칙]\n"
         "1. 하드필터 탈락 종목은 PASS 우선이다.\n"
