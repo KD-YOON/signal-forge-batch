@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 from datetime import datetime
 from statistics import mean
@@ -80,6 +82,7 @@ def get_domestic_current_price(code: str, token: str) -> dict:
         "low": float(out.get("stck_lwpr", 0) or 0),
         "change_pct": float(out.get("prdy_ctrt", 0) or 0),
         "volume": float(out.get("acml_vol", 0) or 0),
+        "prev_close": float(out.get("stck_sdpr", 0) or 0),
         "kis_name": kis_name,
     }
 
@@ -122,6 +125,52 @@ def get_domestic_daily_chart(code: str, token: str, days: int = 30) -> list[dict
             )
         except Exception:
             continue
+    return out
+
+
+def get_domestic_volume_rank_candidates(token: str, limit: int = 40) -> list[dict]:
+    """
+    Apps Script의 getDomesticVolumeRankCandidates_() 역할을 Python으로 옮긴 버전
+    """
+    base_url = _get_env("KIS_BASE_URL", required=False, default=DEFAULT_BASE_URL)
+    url = f"{base_url}/uapi/domestic-stock/v1/quotations/volume-rank"
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_COND_SCR_DIV_CODE": "20171",
+        "FID_INPUT_ISCD": "0000",
+        "FID_DIV_CLS_CODE": "0",
+        "FID_BLNG_CLS_CODE": "0",
+        "FID_TRGT_CLS_CODE": "111111111",
+        "FID_TRGT_EXLS_CLS_CODE": "000000",
+    }
+
+    resp = request_with_retry(
+        "GET",
+        url,
+        headers=_headers(token, "FHPST01710000"),
+        params=params,
+    )
+    data = resp.json()
+    rows = data.get("output", [])[: max(1, min(limit, 100))]
+
+    out = []
+    for idx, row in enumerate(rows, start=1):
+        code = _normalize_code(row.get("mksc_shrn_iscd", ""))
+        name = str(row.get("hts_kor_isnm", "") or "").strip()
+        if not code or not name:
+            continue
+
+        out.append(
+            {
+                "market": "KOR",
+                "code": code,
+                "name": name,
+                "theme": "",
+                "source": "VOLUME_RANK",
+                "rank": idx,
+                "memo": "",
+            }
+        )
     return out
 
 
