@@ -32,6 +32,21 @@ def analyze_stage_signals(item: dict) -> dict:
     }
 
 
+def decide_stage_label(item: dict) -> str:
+    stage_info = analyze_stage_signals(item)
+    stage = stage_info.get("stage", "NEUTRAL")
+
+    label_map = {
+        "BOTTOM": "바닥 탐색",
+        "BOTTOM_REBOUND": "반등 시작",
+        "TREND": "추세 유지",
+        "TREND_STRONG": "강한 추세",
+        "OVERHEAT": "과열 주의",
+        "NEUTRAL": "중립",
+    }
+    return label_map.get(stage, "중립")
+
+
 def compute_weighted_stage_score(item: dict) -> float:
     stage_info = analyze_stage_signals(item)
     stage = stage_info.get("stage", "NEUTRAL")
