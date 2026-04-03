@@ -1,4 +1,3 @@
-import json
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -10,14 +9,14 @@ from app.clients.kis import (
     get_domestic_daily_chart,
 )
 from app.clients.naver import get_news
-from app.services.signals import analyze_stage_signals
+from app.services.candidates import get_combined_candidates
+from app.services.macro import apply_macro_risk_overlay, get_macro_snapshot
+from app.services.signals import (
+    analyze_stage_signals,
+    compute_weighted_stage_score,
+    decide_stage_label,
+)
 
-
-DEFAULT_CANDIDATES = [
-    {"market": "KOR", "code": "005930", "name": "삼성전자", "theme": "반도체 대형주"},
-    {"market": "KOR", "code": "000660", "name": "SK하이닉스", "theme": "AI 반도체"},
-    {"market": "KOR", "code": "035420", "name": "NAVER", "theme": "플랫폼/AI"},
-]
 
 POSITIVE_NEWS_KEYWORDS = [
     "수주", "계약", "공급", "양산", "실적 개선", "실적개선", "흑자전환",
@@ -33,26 +32,18 @@ NEGATIVE_NEWS_KEYWORDS = [
 ]
 
 
-def load_candidates() -> list[dict]:
-    raw = os.getenv("CANDIDATES_JSON", "").strip()
-    if not raw:
-        return DEFAULT_CANDIDATES
-    try:
-        data = json.loads(raw)
-        if isinstance(data, list) and data:
-            return data
-    except Exception:
-        pass
-    return DEFAULT_CANDIDATES
-
-
 def resolve_mode(mode: str) -> str:
     mode = str(mode or "").strip().lower()
-    if mode in ("lunch", "evening", "manual"):
+    if mode in ("lunch", "evening", "manual", "morning"):
         return mode
+
     kst = timezone(timedelta(hours=9))
     hour = datetime.now(kst).hour
-    return "lunch" if hour < 15 else "evening"
+    if hour < 11:
+        return "morning"
+    if hour < 15:
+        return "lunch"
+    return "evening"
 
 
 def _cut(text: str, n: int = 68) -> str:
@@ -119,10 +110,34 @@ def format_news_lines(news_items: list[dict]) -> list[str]:
     return lines
 
 
+def rebuild_stage_after_macro(item: dict) -> dict:
+    total_score = compute_weighted_stage_score(
+        early_score=float(item.get("accumulation_score", 0) or 0),
+        breakout_score=float(item.get("breakout_score", 0) or 0),
+        theme_score=float(item.get("theme_score", 0) or 0),
+        sentiment_adj=float(item.get("sentiment_adj", 0) or 0),
+        risk_score=float(item.get("risk_score", 0) or 0),
+    )
+    stage = decide_stage_label(
+        early_score=float(item.get("accumulation_score", 0) or 0),
+        breakout_score=float(item.get("breakout_score", 0) or 0),
+        risk_score=float(item.get("risk_score", 0) or 0),
+        theme_score=float(item.get("theme_score", 0) or 0),
+        total_score=float(total_score),
+        rsi=float(item.get("rsi", 50) or 50),
+        vol_rate=float(item.get("vol_rate", 0) or 0),
+    )
+    item["total_score"] = int(total_score)
+    item["stage"] = stage
+    return item
+
+
 def build_report(mode: str) -> str:
     resolved_mode = resolve_mode(mode)
     now = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S")
-    candidates = load_candidates()
+    candidates = get_combined_candidates()
+    analyze_limit = int(os.getenv("ANALYZE_TOP_N", "8") or "8")
+    candidates = candidates[:max(1, analyze_limit)]
 
     token = get_access_token()
     analyzed = []
@@ -137,7 +152,7 @@ def build_report(mode: str) -> str:
 
         quote = get_domestic_current_price(code=code, token=token)
         daily = get_domestic_daily_chart(code=code, token=token, days=30)
-        enriched = enrich_with_indicators({"code": code, "name": name, "theme": theme}, quote, daily)
+        enriched = enrich_with_indicators({"code": code, "name": name, "theme": theme, "source": item.get("source", "")}, quote, daily)
 
         news_items = get_news(name, limit=2)
         news_summary = summarize_news(name, news_items)
@@ -148,10 +163,16 @@ def build_report(mode: str) -> str:
         analyzed.append({
             **enriched,
             **stage_info,
+            "candidate_source": item.get("source", ""),
+            "candidate_memo": item.get("memo", ""),
             "news_items": news_items,
             "news_summary": news_summary,
             "news_signal": news_signal,
         })
+
+    macro = get_macro_snapshot()
+    analyzed = apply_macro_risk_overlay(analyzed, macro, resolved_mode)
+    analyzed = [rebuild_stage_after_macro(x) for x in analyzed]
 
     if not analyzed:
         return f"📊 Signal Forge 리포트\n모드: {resolved_mode}\n시각: {now}\n\n추천 종목 없음"
@@ -167,6 +188,8 @@ def build_report(mode: str) -> str:
     top = analyzed[0]
     second = analyzed[1] if len(analyzed) > 1 else None
     market_news = build_market_news_summary(analyzed)
+    macro_regime = str(top.get("macro_regime", "NEUTRAL"))
+    macro_summary = str(top.get("macro_summary", "")).strip() or "매크로 중립"
 
     title_line = "🔥 오늘 최우선 종목"
     strategy_line = "💡 전략: 제안매수가 근처 접근 후 반등 확인"
@@ -176,18 +199,26 @@ def build_report(mode: str) -> str:
     elif resolved_mode == "evening":
         title_line = "🔥 저녁 준비 종목"
         strategy_line = "💡 저녁 전략: 내일 시가와 제안매수가 위치 비교"
+    elif resolved_mode == "morning":
+        title_line = "🔥 오전 우선 종목"
+        strategy_line = "💡 오전 전략: 매크로 레짐과 초반 수급 함께 확인"
 
     top_name = str(top.get("name", "")).strip() or str(top.get("code", "")).strip()
 
     lines = [
-        "📊 Signal Forge 리포트 [STAGE+ENTRY PATCH]",
+        "📊 Signal Forge 리포트 [MACRO+CANDIDATE PATCH]",
         f"모드: {resolved_mode}",
         f"시각: {now}",
+        "",
+        f"🌐 매크로 레짐: {macro_regime}",
+        f"🌐 매크로 요약: {macro_summary}",
+        f"🌐 USD/KRW: {float((macro.get('usdkrw') or {}).get('value', 0) or 0):.2f}",
         "",
         f"🧭 시장 뉴스 포인트: {market_news}",
         "",
         title_line,
         f"{top_name} ({top['code']})",
+        f"후보출처: {top.get('candidate_source', '')}",
         "",
         f"현재가: {int(top['price']):,}원",
         f"전일종가 기준 제안매수가: {int(top['proposed_entry']):,}원",
@@ -223,8 +254,8 @@ def build_report(mode: str) -> str:
         lines += [
             "",
             "➕ 차순위 후보",
-            f"{second_name} ({second['code']}) / 단계 {second['stage']} / 진입판정 {second['entry_decision']}",
-            f"제안매수가 {int(second['proposed_entry']):,}원 / 점수 {second['entry_score']}",
+            f"{second_name} ({second['code']}) / 출처 {second.get('candidate_source', '')}",
+            f"단계 {second['stage']} / 진입판정 {second['entry_decision']} / 진입점수 {second['entry_score']}",
         ]
 
     lines += [
