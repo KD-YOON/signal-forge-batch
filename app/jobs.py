@@ -27,7 +27,8 @@ def main():
     rows = bundle.get("rows", []) or []
     run_type = str(bundle.get("mode", "") or "").upper()
     run_id = str(bundle.get("timestamp", "") or "")
-
+    sync_report_entry_alerts(rows, run_type, run_id)
+    
     synced = sync_report_entry_alerts(rows=rows, run_type=run_type, run_id=run_id)
     print("entry alerts synced:", len(synced))
 
