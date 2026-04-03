@@ -135,21 +135,50 @@ def analyze_stage_signals(item: dict, quote: dict = None, daily: dict = None, ne
     }
 
 
-def decide_stage_label(item: dict) -> str:
-    stage, _ = _classify_stage(item)
+def decide_stage_label(item) -> str:
+    if isinstance(item, dict):
+        stage, _ = _classify_stage(item)
+        label_map = {
+            "BOTTOM": "바닥 탐색",
+            "BOTTOM_REBOUND": "반등 시작",
+            "TREND": "추세 유지",
+            "TREND_STRONG": "강한 추세",
+            "OVERHEAT": "과열 주의",
+            "NEUTRAL": "중립",
+        }
+        return label_map.get(stage, "중립")
 
-    label_map = {
-        "BOTTOM": "바닥 탐색",
-        "BOTTOM_REBOUND": "반등 시작",
-        "TREND": "추세 유지",
-        "TREND_STRONG": "강한 추세",
-        "OVERHEAT": "과열 주의",
-        "NEUTRAL": "중립",
-    }
-    return label_map.get(stage, "중립")
+    score = _safe_float(item, 0)
+    if score >= 80:
+        return "강매수"
+    if score >= 60:
+        return "매수관심"
+    if score >= 40:
+        return "관심"
+    return "관망"
 
 
-def compute_weighted_stage_score(item: dict) -> float:
+def compute_weighted_stage_score(
+    item: dict = None,
+    early_score: float = None,
+    breakout_score: float = None,
+    news_score: float = None,
+    risk_score: float = None,
+    **kwargs,
+) -> float:
+    # 1) reporter.py 쪽에서 개별 점수 인자로 호출하는 경우
+    if early_score is not None or breakout_score is not None or news_score is not None or risk_score is not None:
+        e = _safe_float(early_score, 0)
+        b = _safe_float(breakout_score, 0)
+        n = _safe_float(news_score, 0)
+        r = _safe_float(risk_score, 0)
+
+        score = 35 + e + b + n - r
+        score = max(0, min(100, score))
+        return round(score, 1)
+
+    # 2) analyze_stage_signals 내부에서 item dict로 호출하는 경우
+    item = _as_dict(item)
     stage, _ = _classify_stage(item)
 
     base_map = {
@@ -167,7 +196,7 @@ def compute_weighted_stage_score(item: dict) -> float:
     vol_rate = _safe_float(item.get("vol_rate", 0), 0)
     change_pct = _safe_float(item.get("change_pct", 0), 0)
     rebound = _safe_float(item.get("rebound_from_low", 0), 0)
-    news_score = _safe_float(item.get("news_score", 0), 0)
+    news_score_val = _safe_float(item.get("news_score", 0), 0)
 
     if 45 <= rsi <= 65:
         score += 10
@@ -193,9 +222,9 @@ def compute_weighted_stage_score(item: dict) -> float:
     if rebound >= 2.0:
         score += 4
 
-    if 60 <= news_score < 80:
+    if 60 <= news_score_val < 80:
         score += 4
-    elif news_score >= 80:
+    elif news_score_val >= 80:
         score += 7
 
     score = max(0, min(100, score))
