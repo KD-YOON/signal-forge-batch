@@ -1,3 +1,4 @@
+# === app/services/candidates.py START ===
 from __future__ import annotations
 
 import json
@@ -7,9 +8,9 @@ from app.clients.kis import get_access_token, get_domestic_volume_rank_candidate
 
 
 DEFAULT_CANDIDATES = [
-    {"market": "KOR", "code": "005930", "name": "삼성전자", "theme": "반도체 대형주", "source": "DEFAULT", "rank": 1},
-    {"market": "KOR", "code": "000660", "name": "SK하이닉스", "theme": "AI 반도체", "source": "DEFAULT", "rank": 2},
-    {"market": "KOR", "code": "035420", "name": "NAVER", "theme": "플랫폼/AI", "source": "DEFAULT", "rank": 3},
+    {"market": "KOR", "code": "005930", "name": "삼성전자", "theme": "반도체 대형주", "source": "DEFAULT", "rank": 9001},
+    {"market": "KOR", "code": "000660", "name": "SK하이닉스", "theme": "AI 반도체", "source": "DEFAULT", "rank": 9002},
+    {"market": "KOR", "code": "035420", "name": "NAVER", "theme": "플랫폼/AI", "source": "DEFAULT", "rank": 9003},
 ]
 
 
@@ -58,7 +59,7 @@ def load_watchlist_candidates() -> list[dict]:
                 "name": str(row.get("name", code)).strip(),
                 "theme": str(row.get("theme", "")).strip(),
                 "source": "WATCHLIST",
-                "rank": idx + 1000,
+                "rank": 1000 + idx,
                 "memo": str(row.get("memo", "")).strip(),
             }
         )
@@ -84,7 +85,7 @@ def load_auto_candidates() -> list[dict]:
                 "name": str(row.get("name", code)).strip(),
                 "theme": str(row.get("theme", "")).strip(),
                 "source": "AUTO",
-                "rank": idx + 2000,
+                "rank": 2000 + idx,
                 "memo": str(row.get("memo", "")).strip(),
             }
         )
@@ -92,10 +93,6 @@ def load_auto_candidates() -> list[dict]:
 
 
 def load_volume_rank_candidates() -> list[dict]:
-    """
-    Apps Script의 getDomesticVolumeRankCandidates_() + getCombinedDomesticCandidates_() 흐름을 Python으로 옮김
-    실패하면 빈 리스트 반환
-    """
     try:
         token = get_access_token()
         limit = int(os.getenv("MAX_VOLUME_RANK_FETCH", "40") or "40")
@@ -114,6 +111,7 @@ def merge_candidate_lists(*lists: list[dict]) -> list[dict]:
                 continue
 
             incoming_rank = int(item.get("rank", idx))
+
             if code not in merged:
                 merged[code] = {
                     **item,
@@ -125,6 +123,7 @@ def merge_candidate_lists(*lists: list[dict]) -> list[dict]:
             prev = merged[code]
             prev_source = str(prev.get("source", "")).strip()
             new_source = str(item.get("source", "")).strip()
+
             source_joined = "+".join([s for s in [prev_source, new_source] if s])
 
             merged[code] = {
@@ -150,7 +149,7 @@ def get_combined_candidates() -> list[dict]:
     1) 거래량 랭킹 후보
     2) WATCHLIST
     3) AUTO_CANDIDATES_JSON
-    4) DEFAULT (fallback)
+    4) DEFAULT fallback
     """
     volume_rows = load_volume_rank_candidates()
     watchlist = load_watchlist_candidates()
@@ -161,3 +160,4 @@ def get_combined_candidates() -> list[dict]:
 
     analyze_limit = int(os.getenv("MAX_TOTAL_ANALYZE", "20") or "20")
     return merged[: max(1, analyze_limit)]
+# === app/services/candidates.py END ===
