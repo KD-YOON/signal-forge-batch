@@ -27,8 +27,20 @@ def get_access_token() -> str:
         "appkey": app_key,
         "appsecret": app_secret,
     }
+
+    print(
+        "[KIS DEBUG] token request",
+        {
+            "base_url": base_url,
+            "app_key_prefix": app_key[:6] if app_key else "",
+            "app_secret_prefix": app_secret[:6] if app_secret else "",
+        },
+    )
+
     resp = request_with_retry("POST", url, json=payload)
     data = resp.json()
+
+    print("[KIS DEBUG] token response keys", list(data.keys()) if isinstance(data, dict) else type(data))
 
     token = data.get("access_token", "")
     if not token:
