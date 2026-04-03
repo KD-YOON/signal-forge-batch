@@ -9,7 +9,12 @@ from app.clients.kis import (
     get_domestic_current_price,
     get_domestic_daily_chart,
 )
-from app.clients.naver import get_news
+from app.clients.naver import get_news as get_kor_news
+from app.clients.yahoo_us import (
+    get_us_current_price,
+    get_us_daily_chart,
+    get_us_news,
+)
 from app.services.candidates import get_combined_candidates
 from app.services.macro import apply_macro_risk_overlay, get_macro_snapshot
 from app.services.signals import (
@@ -25,12 +30,14 @@ POSITIVE_NEWS_KEYWORDS = [
     "가이던스 상향", "증설", "인수", "합병", "파트너십", "정책 수혜",
     "데이터센터", "ai", "반도체", "전기차", "국책", "대규모",
     "호실적", "영업이익", "매출 증가", "목표가 상향", "기관 매수", "외국인 매수",
+    "earnings", "guidance", "upgrade", "data center", "ai demand",
 ]
 
 NEGATIVE_NEWS_KEYWORDS = [
     "유상증자", "전환사채", "cb", "bw", "하한가", "소송", "과징금",
     "실적 부진", "실적부진", "가이던스 하향", "적자", "감자", "상장폐지",
     "횡령", "배임", "리콜", "규제", "조사", "경고", "목표가 하향", "매도 리포트",
+    "downgrade", "lawsuit", "sec", "recall", "miss", "delay",
 ]
 
 KST = timezone(timedelta(hours=9))
@@ -66,6 +73,62 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return float(default)
+
+
+def _market_of(value: Any) -> str:
+    return str(value or "KOR").upper().strip() or "KOR"
+
+
+def _is_us_market(value: Any) -> bool:
+    return _market_of(value) == "US"
+
+
+def _format_price(value: Any, market: str = "KOR") -> str:
+    num = _safe_float(value, 0.0)
+    if num <= 0:
+        return "-"
+    if _is_us_market(market):
+        return f"${num:,.2f}"
+    return f"{int(round(num)):,}원"
+
+
+def _format_price_with_krw(value: Any, market: str = "KOR", fx_value: Any = 0.0) -> str:
+    num = _safe_float(value, 0.0)
+    if num <= 0:
+        return "-"
+
+    if not _is_us_market(market):
+        return _format_price(num, market)
+
+    fx = _safe_float(fx_value, 0.0)
+    if fx > 0:
+        krw = int(round(num * fx))
+        return f"${num:,.2f} (약 {krw:,}원)"
+    return f"${num:,.2f}"
+
+
+def _get_news_by_market(market: str, code: str, name: str, limit: int = 2) -> list[dict]:
+    market = _market_of(market)
+    if market == "US":
+        return get_us_news(code, limit=max(1, limit))
+    return get_kor_news(name, limit=max(1, limit))
+
+
+def _get_quote_and_daily(item: dict, token: str | None = None) -> tuple[dict, list[dict]]:
+    market = _market_of(item.get("market", "KOR"))
+    code = str(item.get("code", "")).strip()
+
+    if market == "US":
+        quote = get_us_current_price(code)
+        daily = get_us_daily_chart(code, days=60)
+        return quote, daily
+
+    if not token:
+        token = get_access_token()
+
+    quote = get_domestic_current_price(code=code, token=token)
+    daily = get_domestic_daily_chart(code=code, token=token, days=60)
+    return quote, daily
 
 
 def evaluate_news_trade_signal(news_items: list[dict], news_summary: str) -> dict:
@@ -112,8 +175,9 @@ def build_market_news_summary(items: list[dict]) -> str:
     parts = []
     for row in items[:2]:
         name = str(row.get("name", "")).strip() or str(row.get("code", "")).strip()
+        market = _market_of(row.get("market", "KOR"))
         summary = str(row.get("news_summary", "")).strip() or "관련 투자 뉴스 부족"
-        parts.append(f"[{name}] {summary}")
+        parts.append(f"[{market} {name}] {summary}")
     return " / ".join(parts)
 
 
@@ -155,27 +219,39 @@ def _analyze_candidates(resolved_mode: str) -> list[dict]:
     recent = get_recent_tickers(days=3)
     filtered_candidates = []
     for c in candidates:
-        ticker = str(c.get("code", "")).strip()
-        if ticker in recent:
+        market = _market_of(c.get("market", "KOR"))
+        ticker = str(c.get("code", "")).strip().upper()
+        recent_key1 = ticker
+        recent_key2 = f"{market}:{ticker}"
+        if recent_key1 in recent or recent_key2 in recent:
             continue
         filtered_candidates.append(c)
 
     analyze_limit = int(os.getenv("ANALYZE_TOP_N", "8") or "8")
     candidates = filtered_candidates[: max(1, analyze_limit)]
 
-    token = get_access_token()
+    has_kor = any(_market_of(x.get("market", "KOR")) == "KOR" for x in candidates)
+    token = get_access_token() if has_kor else None
+
     analyzed: list[dict] = []
 
     for item in candidates:
-        if str(item.get("market", "")).upper() != "KOR":
+        market = _market_of(item.get("market", "KOR"))
+        code = str(item.get("code", "")).strip().upper()
+        if not code:
             continue
 
-        code = str(item.get("code", "")).strip()
-        name = str(item.get("name", code)).strip()
+        name = str(item.get("name", code)).strip() or code
         theme = str(item.get("theme", "")).strip()
 
-        quote = get_domestic_current_price(code=code, token=token)
-        daily = get_domestic_daily_chart(code=code, token=token, days=60)
+        try:
+            quote, daily = _get_quote_and_daily(item, token=token)
+        except Exception as e:
+            print(f"candidate analyze skipped {market} {code}: {e}")
+            continue
+
+        if not quote:
+            continue
 
         enriched = enrich_with_indicators(
             {
@@ -184,14 +260,19 @@ def _analyze_candidates(resolved_mode: str) -> list[dict]:
                 "theme": theme,
                 "source": item.get("source", ""),
                 "memo": item.get("memo", ""),
-                "market": "KOR",
+                "market": market,
             },
             quote,
             daily,
         )
 
-        news_items = get_news(name, limit=2)
-        news_summary = summarize_news(name, news_items)
+        if market == "US":
+            long_name = str(quote.get("long_name", "")).strip()
+            if long_name:
+                enriched["name"] = long_name
+
+        news_items = _get_news_by_market(market, code, name, limit=2)
+        news_summary = summarize_news(name, news_items, market=market)
         news_signal = evaluate_news_trade_signal(news_items, news_summary)
 
         stage_info = analyze_stage_signals(enriched, quote, daily, news_signal)
@@ -205,18 +286,22 @@ def _analyze_candidates(resolved_mode: str) -> list[dict]:
                 "news_items": news_items,
                 "news_summary": news_summary,
                 "news_signal": news_signal,
-                "market": "KOR",
+                "market": market,
                 "run_mode": resolved_mode,
+                "currency": str(quote.get("currency", "USD" if market == "US" else "KRW")).strip() or ("USD" if market == "US" else "KRW"),
+                "market_state": str(quote.get("market_state", "")).strip(),
             }
         )
 
     seen = set()
     unique_analyzed = []
     for row in analyzed:
-        code = str(row.get("code", "")).strip()
-        if not code or code in seen:
+        market = _market_of(row.get("market", "KOR"))
+        code = str(row.get("code", "")).strip().upper()
+        key = f"{market}:{code}"
+        if not code or key in seen:
             continue
-        seen.add(code)
+        seen.add(key)
         unique_analyzed.append(row)
 
     return unique_analyzed
@@ -251,7 +336,10 @@ def _apply_post_filters(rows: list[dict], resolved_mode: str) -> tuple[list[dict
 
 
 def build_entry_alert_payload(top: dict, resolved_mode: str, now_text: str) -> dict:
+    market = _market_of(top.get("market", "KOR"))
     return {
+        "market": market,
+        "currency": str(top.get("currency", "USD" if market == "US" else "KRW")).strip() or ("USD" if market == "US" else "KRW"),
         "name": str(top.get("name", "")).strip() or str(top.get("code", "")).strip(),
         "code": str(top.get("code", "")).strip(),
         "mode": resolved_mode,
@@ -263,14 +351,14 @@ def build_entry_alert_payload(top: dict, resolved_mode: str, now_text: str) -> d
         "entry_score": _safe_int(top.get("entry_score", 0)),
         "quality_score": _safe_int(top.get("quality_score", 0)),
         "total_score": _safe_int(top.get("total_score", 0)),
-        "proposed_entry": _safe_int(top.get("proposed_entry", 0)),
-        "entry_zone_low": _safe_int(top.get("entry_zone_low", 0)),
-        "entry_zone_high": _safe_int(top.get("entry_zone_high", 0)),
-        "stop_loss": _safe_int(top.get("stop_loss", 0)),
-        "target1": _safe_int(top.get("target1", 0)),
-        "target2": _safe_int(top.get("target2", 0)),
-        "current_price": _safe_int(top.get("price", 0)),
-        "prev_close": _safe_int(top.get("prev_close", 0)),
+        "proposed_entry": _safe_float(top.get("proposed_entry", 0)),
+        "entry_zone_low": _safe_float(top.get("entry_zone_low", 0)),
+        "entry_zone_high": _safe_float(top.get("entry_zone_high", 0)),
+        "stop_loss": _safe_float(top.get("stop_loss", 0)),
+        "target1": _safe_float(top.get("target1", 0)),
+        "target2": _safe_float(top.get("target2", 0)),
+        "current_price": _safe_float(top.get("price", 0)),
+        "prev_close": _safe_float(top.get("prev_close", 0)),
         "rsi": _safe_float(top.get("rsi", 0)),
         "vol_rate": _safe_float(top.get("vol_rate", 0)),
         "news_bias": str((top.get("news_signal") or {}).get("bias", "")),
@@ -285,6 +373,7 @@ def build_entry_alert_payload(top: dict, resolved_mode: str, now_text: str) -> d
         "ai_verdict": str(top.get("ai_verdict", "")).strip(),
         "ai_risk": str(top.get("ai_risk", "")).strip(),
         "ai_confidence": _safe_int(top.get("ai_confidence", 0)),
+        "fx_value": _safe_float((get_macro_snapshot().get("usdkrw") or {}).get("value", 0), 0.0) if market == "US" else 1.0,
     }
 
 
@@ -292,19 +381,23 @@ def build_entry_alert_text(payload: dict) -> str:
     if not str(payload.get("entry_decision", "")).startswith("ENTRY"):
         return ""
 
+    market = _market_of(payload.get("market", "KOR"))
+    fx_value = _safe_float(payload.get("fx_value", 0), 0.0)
+
     lines = [
         "🚨 ENTRY ALERT",
         f"{payload.get('name', '')} ({payload.get('code', '')})",
+        f"시장: {market}",
         f"모드: {payload.get('mode', '')}",
         f"시각: {payload.get('timestamp', '')}",
         "",
         f"단계: {payload.get('final_stage', payload.get('stage', ''))}",
         f"진입판정: {payload.get('entry_decision', '')} (진입점수 {payload.get('entry_score', 0)})",
         f"진입사유: {payload.get('entry_reason', '')}",
-        f"제안매수가: {payload.get('proposed_entry', 0):,}원",
-        f"관심구간: {payload.get('entry_zone_low', 0):,} ~ {payload.get('entry_zone_high', 0):,}원",
-        f"손절가: {payload.get('stop_loss', 0):,}원",
-        f"목표가1: {payload.get('target1', 0):,}원 / 목표가2: {payload.get('target2', 0):,}원",
+        f"제안매수가: {_format_price_with_krw(payload.get('proposed_entry', 0), market, fx_value)}",
+        f"관심구간: {_format_price(payload.get('entry_zone_low', 0), market)} ~ {_format_price(payload.get('entry_zone_high', 0), market)}",
+        f"손절가: {_format_price(payload.get('stop_loss', 0), market)}",
+        f"목표가1: {_format_price(payload.get('target1', 0), market)} / 목표가2: {_format_price(payload.get('target2', 0), market)}",
         "",
         f"뉴스 판정: {payload.get('news_bias', '')}",
         f"뉴스 키워드: {payload.get('news_keywords', '')}",
@@ -338,6 +431,8 @@ def build_report_text(rows: list[dict], macro: dict, resolved_mode: str, now_tex
         strategy_line = "💡 오전 전략: 매크로 레짐과 초반 수급 함께 확인"
 
     top_name = str(top.get("name", "")).strip() or str(top.get("code", "")).strip()
+    top_market = _market_of(top.get("market", "KOR"))
+    usdkrw = _safe_float((macro.get("usdkrw") or {}).get("value", 0), 0.0)
 
     lines = [
         "📊 Signal Forge 리포트 [PIPELINE PATCH]",
@@ -346,19 +441,20 @@ def build_report_text(rows: list[dict], macro: dict, resolved_mode: str, now_tex
         "",
         f"🌐 매크로 레짐: {macro_regime}",
         f"🌐 매크로 요약: {macro_summary}",
-        f"🌐 USD/KRW: {float((macro.get('usdkrw') or {}).get('value', 0) or 0):.2f}",
+        f"🌐 USD/KRW: {usdkrw:.2f}",
         "",
         f"🧭 시장 뉴스 포인트: {market_news}",
         "",
         title_line,
         f"{top_name} ({top['code']})",
+        f"시장: {top_market}",
         f"후보출처: {top.get('candidate_source', '')}",
         "",
-        f"현재가: {_safe_int(top.get('price', 0)):,}원",
-        f"전일종가 기준 제안매수가: {_safe_int(top.get('proposed_entry', 0)):,}원",
-        f"관심구간: {_safe_int(top.get('entry_zone_low', 0)):,} ~ {_safe_int(top.get('entry_zone_high', 0)):,}원",
-        f"손절가: {_safe_int(top.get('stop_loss', 0)):,}원",
-        f"목표가1: {_safe_int(top.get('target1', 0)):,}원 / 목표가2: {_safe_int(top.get('target2', 0)):,}원",
+        f"현재가: {_format_price_with_krw(top.get('price', 0), top_market, usdkrw)}",
+        f"전일종가 기준 제안매수가: {_format_price_with_krw(top.get('proposed_entry', 0), top_market, usdkrw)}",
+        f"관심구간: {_format_price(top.get('entry_zone_low', 0), top_market)} ~ {_format_price(top.get('entry_zone_high', 0), top_market)}",
+        f"손절가: {_format_price(top.get('stop_loss', 0), top_market)}",
+        f"목표가1: {_format_price(top.get('target1', 0), top_market)} / 목표가2: {_format_price(top.get('target2', 0), top_market)}",
         "",
         f"최종단계: {top.get('stage', '')}",
         f"AI 최종단계: {top.get('final_stage', top.get('stage', ''))}",
@@ -389,10 +485,11 @@ def build_report_text(rows: list[dict], macro: dict, resolved_mode: str, now_tex
 
     if second:
         second_name = str(second.get("name", "")).strip() or str(second.get("code", "")).strip()
+        second_market = _market_of(second.get("market", "KOR"))
         lines += [
             "",
             "➕ 차순위 후보",
-            f"{second_name} ({second['code']}) / 출처 {second.get('candidate_source', '')}",
+            f"{second_name} ({second['code']}) / 시장 {second_market} / 출처 {second.get('candidate_source', '')}",
             f"단계 {second.get('final_stage', second.get('stage', ''))} / 진입판정 {second.get('entry_decision', '')} / 진입점수 {_safe_int(second.get('entry_score', 0))}",
         ]
 
@@ -412,7 +509,7 @@ def run_report_pipeline(mode: str) -> dict:
     rows = _analyze_candidates(resolved_mode)
     rows, macro = _apply_post_filters(rows, resolved_mode)
 
-    top_tickers = [str(x.get("code", "")).strip() for x in rows[:5] if str(x.get("code", "")).strip()]
+    top_tickers = [f"{_market_of(x.get('market', 'KOR'))}:{str(x.get('code', '')).strip()}" for x in rows[:5] if str(x.get("code", "")).strip()]
     if top_tickers:
         add_recommendations(top_tickers)
 
