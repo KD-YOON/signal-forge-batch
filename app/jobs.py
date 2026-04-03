@@ -27,17 +27,18 @@ def main():
     rows = bundle.get("rows", []) or []
     run_type = str(bundle.get("mode", "") or "").upper()
     run_id = str(bundle.get("timestamp", "") or "")
-    sync_report_entry_alerts(rows, run_type, run_id)
-    
+
     synced = sync_report_entry_alerts(rows=rows, run_type=run_type, run_id=run_id)
     print("entry alerts synced:", len(synced))
 
     top_code = ""
     top_name = ""
+    top_market = ""
     if rows:
         top = rows[0] or {}
         top_code = str(top.get("code", "") or "").strip()
         top_name = str(top.get("name", "") or "").strip()
+        top_market = str(top.get("market", "") or "").strip().upper()
 
     print(
         "pipeline summary:",
@@ -45,6 +46,7 @@ def main():
             "mode": bundle.get("mode"),
             "timestamp": bundle.get("timestamp"),
             "rows_count": len(rows),
+            "top_market": top_market,
             "top_code": top_code,
             "top_name": top_name,
             "has_entry_alert": bool(entry_alert_text),
