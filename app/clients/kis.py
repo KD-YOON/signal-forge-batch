@@ -12,12 +12,16 @@ from app.utils import request_with_retry
 
 DEFAULT_BASE_URL = "https://openapi.koreainvestment.com:9443"
 DEFAULT_TOKEN_CACHE_FILE = "kis_token_cache.json"
+DEFAULT_TOKEN_CACHE_KEY = "signal_forge:kis:access_token"
 
 # 실행 프로세스 내 캐시
 _TOKEN_CACHE = {
     "token": "",
     "expires_at": 0.0,  # epoch seconds
 }
+
+_REDIS_CLIENT = None
+_REDIS_INIT_DONE = False
 
 
 def _get_env(name: str, required: bool = True, default: str = "") -> str:
@@ -34,12 +38,27 @@ def _safe_int(value, default: int = 0) -> int:
         return int(default)
 
 
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
 def _token_cache_file() -> str:
     """
     환경변수로 캐시 파일 경로를 지정할 수 있게 함.
     미지정 시 프로젝트 루트 기준 kis_token_cache.json 사용.
     """
     return os.getenv("KIS_TOKEN_CACHE_FILE", DEFAULT_TOKEN_CACHE_FILE).strip() or DEFAULT_TOKEN_CACHE_FILE
+
+
+def _token_cache_key() -> str:
+    return os.getenv("KIS_TOKEN_CACHE_KEY", DEFAULT_TOKEN_CACHE_KEY).strip() or DEFAULT_TOKEN_CACHE_KEY
+
+
+def _token_cache_ttl_sec() -> int:
+    return _safe_int(os.getenv("KIS_TOKEN_CACHE_TTL_SEC", "86400"), 86400)
 
 
 def _parse_expiry_seconds(data: dict) -> int:
@@ -92,6 +111,9 @@ def _save_token_cache_file(token: str, expires_at: float) -> None:
     }
 
     try:
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
     except Exception as e:
@@ -108,10 +130,75 @@ def _is_token_usable(token: str, expires_at: float, buffer_sec: int = 1800) -> b
     return float(expires_at) > time.time() + max(0, int(buffer_sec))
 
 
+def _get_redis_client():
+    global _REDIS_CLIENT, _REDIS_INIT_DONE
+
+    if _REDIS_INIT_DONE:
+        return _REDIS_CLIENT
+
+    _REDIS_INIT_DONE = True
+
+    redis_url = os.getenv("KIS_TOKEN_CACHE_REDIS_URL", "").strip()
+    if not redis_url:
+        return None
+
+    try:
+        import redis  # type: ignore
+
+        client = redis.from_url(redis_url, decode_responses=True)
+        client.ping()
+        _REDIS_CLIENT = client
+        print("[KIS DEBUG] redis cache connected")
+        return _REDIS_CLIENT
+    except Exception as e:
+        print("[KIS DEBUG] redis cache unavailable", str(e))
+        _REDIS_CLIENT = None
+        return None
+
+
+def _load_token_cache_redis() -> dict:
+    client = _get_redis_client()
+    if not client:
+        return {}
+
+    try:
+        raw = client.get(_token_cache_key())
+        if not raw:
+            return {}
+
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+    except Exception as e:
+        print("[KIS DEBUG] redis cache load failed", str(e))
+
+    return {}
+
+
+def _save_token_cache_redis(token: str, expires_at: float) -> None:
+    client = _get_redis_client()
+    if not client:
+        return
+
+    payload = {
+        "access_token": token,
+        "expires_at": float(expires_at),
+        "saved_at": time.time(),
+    }
+
+    try:
+        ttl = max(60, _token_cache_ttl_sec())
+        client.set(_token_cache_key(), json.dumps(payload, ensure_ascii=False), ex=ttl)
+    except Exception as e:
+        print("[KIS DEBUG] redis cache save failed", str(e))
+
+
 def _get_valid_cached_token(buffer_sec: int = 1800) -> str:
     """
-    1) 메모리 캐시 확인
-    2) 파일 캐시 확인
+    우선순위:
+    1) 메모리 캐시
+    2) Redis/Valkey 외부 캐시
+    3) 파일 캐시
     buffer_sec 이내 만료 예정이면 재발급
     """
     global _TOKEN_CACHE
@@ -123,10 +210,20 @@ def _get_valid_cached_token(buffer_sec: int = 1800) -> str:
         print("[KIS DEBUG] token source = memory_cache")
         return mem_token
 
-    # 2. 파일 캐시
-    cached = _load_token_cache_file()
-    file_token = str(cached.get("access_token", "") or "").strip()
-    file_exp = float(cached.get("expires_at", 0) or 0)
+    # 2. Redis/Valkey 캐시
+    cached_redis = _load_token_cache_redis()
+    redis_token = str(cached_redis.get("access_token", "") or "").strip()
+    redis_exp = float(cached_redis.get("expires_at", 0) or 0)
+    if _is_token_usable(redis_token, redis_exp, buffer_sec=buffer_sec):
+        _TOKEN_CACHE["token"] = redis_token
+        _TOKEN_CACHE["expires_at"] = redis_exp
+        print("[KIS DEBUG] token source = redis_cache")
+        return redis_token
+
+    # 3. 파일 캐시
+    cached_file = _load_token_cache_file()
+    file_token = str(cached_file.get("access_token", "") or "").strip()
+    file_exp = float(cached_file.get("expires_at", 0) or 0)
     if _is_token_usable(file_token, file_exp, buffer_sec=buffer_sec):
         _TOKEN_CACHE["token"] = file_token
         _TOKEN_CACHE["expires_at"] = file_exp
@@ -147,6 +244,8 @@ def _set_cached_token(token: str, expires_in: int) -> None:
 
     _TOKEN_CACHE["token"] = token
     _TOKEN_CACHE["expires_at"] = expires_at
+
+    _save_token_cache_redis(token, expires_at)
     _save_token_cache_file(token, expires_at)
 
 
@@ -158,12 +257,21 @@ def clear_cached_token() -> None:
     _TOKEN_CACHE["token"] = ""
     _TOKEN_CACHE["expires_at"] = 0.0
 
+    # 파일 캐시 삭제
     path = _token_cache_file()
     try:
         if os.path.exists(path):
             os.remove(path)
     except Exception as e:
         print("[KIS DEBUG] token cache clear failed", str(e))
+
+    # Redis 캐시 삭제
+    client = _get_redis_client()
+    if client:
+        try:
+            client.delete(_token_cache_key())
+        except Exception as e:
+            print("[KIS DEBUG] redis cache clear failed", str(e))
 
 
 def get_access_token(force_refresh: bool = False) -> str:
@@ -174,7 +282,9 @@ def get_access_token(force_refresh: bool = False) -> str:
     - 응답 body 에서 토큰을 확인하고 expires_in / access_token_token_expired 기준으로 저장
     """
     if not force_refresh:
-        cached_token = _get_valid_cached_token(buffer_sec=_safe_int(os.getenv("KIS_TOKEN_BUFFER_SEC", "1800"), 1800))
+        cached_token = _get_valid_cached_token(
+            buffer_sec=_safe_int(os.getenv("KIS_TOKEN_BUFFER_SEC", "1800"), 1800)
+        )
         if cached_token:
             return cached_token
 
@@ -197,6 +307,8 @@ def get_access_token(force_refresh: bool = False) -> str:
             "app_secret_prefix": app_secret[:6] if app_secret else "",
             "force_refresh": force_refresh,
             "cache_file": _token_cache_file(),
+            "cache_key": _token_cache_key(),
+            "has_redis": bool(os.getenv("KIS_TOKEN_CACHE_REDIS_URL", "").strip()),
         },
     )
 
