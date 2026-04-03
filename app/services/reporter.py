@@ -173,7 +173,7 @@ def build_market_news_summary(items: list[dict]) -> str:
     if not items:
         return "시장 뉴스 포인트 없음"
     parts = []
-    for row in items[:2]:
+    for row in items[:3]:
         name = str(row.get("name", "")).strip() or str(row.get("code", "")).strip()
         market = _market_of(row.get("market", "KOR"))
         summary = str(row.get("news_summary", "")).strip() or "관련 투자 뉴스 부족"
@@ -213,6 +213,41 @@ def rebuild_stage_after_macro(item: dict) -> dict:
     return item
 
 
+def split_rows_by_market(rows: list[dict]) -> dict:
+    kor_rows = [x for x in rows if _market_of(x.get("market", "KOR")) == "KOR"]
+    us_rows = [x for x in rows if _market_of(x.get("market", "KOR")) == "US"]
+
+    return {
+        "all": rows,
+        "kor": kor_rows,
+        "us": us_rows,
+        "top_all": rows[0] if rows else None,
+        "top_kor": kor_rows[0] if kor_rows else None,
+        "top_us": us_rows[0] if us_rows else None,
+    }
+
+
+def _build_market_leader_block(title: str, row: dict | None, usdkrw: float) -> list[str]:
+    if not row:
+        return [title, "- 후보 없음"]
+
+    market = _market_of(row.get("market", "KOR"))
+    name = str(row.get("name", "")).strip() or str(row.get("code", "")).strip()
+
+    return [
+        title,
+        f"{name} ({row.get('code', '')})",
+        f"시장: {market}",
+        f"현재가: {_format_price_with_krw(row.get('price', 0), market, usdkrw)}",
+        f"제안매수가: {_format_price_with_krw(row.get('proposed_entry', 0), market, usdkrw)}",
+        f"관심구간: {_format_price(row.get('entry_zone_low', 0), market)} ~ {_format_price(row.get('entry_zone_high', 0), market)}",
+        f"최종단계: {row.get('final_stage', row.get('stage', ''))}",
+        f"진입판정: {row.get('entry_decision', '')} (진입점수 {_safe_int(row.get('entry_score', 0))})",
+        f"총점: {_safe_int(row.get('total_score', 0))} / 품질점수: {_safe_int(row.get('quality_score', 0))}",
+        f"뉴스요약: {row.get('news_summary', '')}",
+    ]
+
+
 def _analyze_candidates(resolved_mode: str) -> list[dict]:
     candidates = get_combined_candidates()
 
@@ -227,7 +262,7 @@ def _analyze_candidates(resolved_mode: str) -> list[dict]:
             continue
         filtered_candidates.append(c)
 
-    analyze_limit = int(os.getenv("ANALYZE_TOP_N", "8") or "8")
+    analyze_limit = int(os.getenv("ANALYZE_TOP_N", "12") or "12")
     candidates = filtered_candidates[: max(1, analyze_limit)]
 
     has_kor = any(_market_of(x.get("market", "KOR")) == "KOR" for x in candidates)
@@ -274,7 +309,6 @@ def _analyze_candidates(resolved_mode: str) -> list[dict]:
         news_items = _get_news_by_market(market, code, name, limit=2)
         news_summary = summarize_news(name, news_items, market=market)
         news_signal = evaluate_news_trade_signal(news_items, news_summary)
-
         stage_info = analyze_stage_signals(enriched, quote, daily, news_signal)
 
         analyzed.append(
@@ -337,6 +371,8 @@ def _apply_post_filters(rows: list[dict], resolved_mode: str) -> tuple[list[dict
 
 def build_entry_alert_payload(top: dict, resolved_mode: str, now_text: str) -> dict:
     market = _market_of(top.get("market", "KOR"))
+    fx_value = _safe_float((get_macro_snapshot().get("usdkrw") or {}).get("value", 0), 0.0) if market == "US" else 1.0
+
     return {
         "market": market,
         "currency": str(top.get("currency", "USD" if market == "US" else "KRW")).strip() or ("USD" if market == "US" else "KRW"),
@@ -373,7 +409,7 @@ def build_entry_alert_payload(top: dict, resolved_mode: str, now_text: str) -> d
         "ai_verdict": str(top.get("ai_verdict", "")).strip(),
         "ai_risk": str(top.get("ai_risk", "")).strip(),
         "ai_confidence": _safe_int(top.get("ai_confidence", 0)),
-        "fx_value": _safe_float((get_macro_snapshot().get("usdkrw") or {}).get("value", 0), 0.0) if market == "US" else 1.0,
+        "fx_value": fx_value,
     }
 
 
@@ -412,30 +448,33 @@ def build_report_text(rows: list[dict], macro: dict, resolved_mode: str, now_tex
     if not rows:
         return f"📊 Signal Forge 리포트\n모드: {resolved_mode}\n시각: {now_text}\n\n추천 종목 없음"
 
-    top = rows[0]
-    second = rows[1] if len(rows) > 1 else None
+    grouped = split_rows_by_market(rows)
+    top_all = grouped["top_all"]
+    top_kor = grouped["top_kor"]
+    top_us = grouped["top_us"]
+
     market_news = build_market_news_summary(rows)
-    macro_regime = str(top.get("macro_regime", "NEUTRAL"))
-    macro_summary = str(top.get("macro_summary", "")).strip() or "매크로 중립"
-
-    title_line = "🔥 오늘 최우선 종목"
-    strategy_line = "💡 전략: 제안매수가 근처 접근 후 반등 확인"
-    if resolved_mode == "lunch":
-        title_line = "🔥 점심 체크 종목"
-        strategy_line = "💡 점심 전략: 관심구간 접근 여부와 장중 반등 확인"
-    elif resolved_mode == "evening":
-        title_line = "🔥 저녁 준비 종목"
-        strategy_line = "💡 저녁 전략: 내일 시가와 제안매수가 위치 비교"
-    elif resolved_mode == "morning":
-        title_line = "🔥 오전 우선 종목"
-        strategy_line = "💡 오전 전략: 매크로 레짐과 초반 수급 함께 확인"
-
-    top_name = str(top.get("name", "")).strip() or str(top.get("code", "")).strip()
-    top_market = _market_of(top.get("market", "KOR"))
+    macro_regime = str((top_all or {}).get("macro_regime", "NEUTRAL"))
+    macro_summary = str((top_all or {}).get("macro_summary", "")).strip() or "매크로 중립"
     usdkrw = _safe_float((macro.get("usdkrw") or {}).get("value", 0), 0.0)
 
+    title_line = "🔥 오늘 통합 1등"
+    strategy_line = "💡 전략: 시장별 1등 후보를 각각 비교해 관심구간 접근 여부 확인"
+    if resolved_mode == "lunch":
+        title_line = "🔥 점심 통합 1등"
+        strategy_line = "💡 점심 전략: 국내/해외 대표주 장중 위치 비교"
+    elif resolved_mode == "evening":
+        title_line = "🔥 저녁 통합 1등"
+        strategy_line = "💡 저녁 전략: 다음 거래 세션용 국내/해외 대표주 준비"
+    elif resolved_mode == "morning":
+        title_line = "🔥 오전 통합 1등"
+        strategy_line = "💡 오전 전략: 매크로 레짐과 시장별 대표주 동시 점검"
+
+    top_all_name = str((top_all or {}).get("name", "")).strip() or str((top_all or {}).get("code", "")).strip()
+    top_all_market = _market_of((top_all or {}).get("market", "KOR"))
+
     lines = [
-        "📊 Signal Forge 리포트 [PIPELINE PATCH]",
+        "📊 Signal Forge 리포트 [DUAL MARKET PATCH]",
         f"모드: {resolved_mode}",
         f"시각: {now_text}",
         "",
@@ -446,56 +485,34 @@ def build_report_text(rows: list[dict], macro: dict, resolved_mode: str, now_tex
         f"🧭 시장 뉴스 포인트: {market_news}",
         "",
         title_line,
-        f"{top_name} ({top['code']})",
-        f"시장: {top_market}",
-        f"후보출처: {top.get('candidate_source', '')}",
+        f"{top_all_name} ({(top_all or {}).get('code', '')})",
+        f"시장: {top_all_market}",
+        f"현재가: {_format_price_with_krw((top_all or {}).get('price', 0), top_all_market, usdkrw)}",
+        f"제안매수가: {_format_price_with_krw((top_all or {}).get('proposed_entry', 0), top_all_market, usdkrw)}",
+        f"관심구간: {_format_price((top_all or {}).get('entry_zone_low', 0), top_all_market)} ~ {_format_price((top_all or {}).get('entry_zone_high', 0), top_all_market)}",
+        f"최종단계: {(top_all or {}).get('final_stage', (top_all or {}).get('stage', ''))}",
+        f"진입판정: {(top_all or {}).get('entry_decision', '')} (진입점수 {_safe_int((top_all or {}).get('entry_score', 0))})",
         "",
-        f"현재가: {_format_price_with_krw(top.get('price', 0), top_market, usdkrw)}",
-        f"전일종가 기준 제안매수가: {_format_price_with_krw(top.get('proposed_entry', 0), top_market, usdkrw)}",
-        f"관심구간: {_format_price(top.get('entry_zone_low', 0), top_market)} ~ {_format_price(top.get('entry_zone_high', 0), top_market)}",
-        f"손절가: {_format_price(top.get('stop_loss', 0), top_market)}",
-        f"목표가1: {_format_price(top.get('target1', 0), top_market)} / 목표가2: {_format_price(top.get('target2', 0), top_market)}",
-        "",
-        f"최종단계: {top.get('stage', '')}",
-        f"AI 최종단계: {top.get('final_stage', top.get('stage', ''))}",
-        f"진입판정: {top.get('entry_decision', '')} (진입점수 {_safe_int(top.get('entry_score', 0))})",
-        f"진입사유: {top.get('entry_reason', '')}",
-        "",
-        f"등락률: {_safe_float(top.get('change_pct', 0)):.2f}%",
-        f"거래량비: {_safe_float(top.get('vol_rate', 0)):.1f}%",
-        f"RSI: {_safe_float(top.get('rsi', 0)):.1f}",
-        f"총점: {_safe_int(top.get('total_score', 0))}",
-        f"품질점수: {_safe_int(top.get('quality_score', 0))}",
-        f"매집점수: {_safe_int(top.get('accumulation_score', 0))} / 돌파점수: {_safe_int(top.get('breakout_score', 0))} / 리스크점수: {_safe_int(top.get('risk_score', 0))}",
-        f"테마: {top.get('theme', '')}",
-        f"뉴스 판정: {(top.get('news_signal') or {}).get('bias', '')}",
-        f"뉴스 키워드: {(top.get('news_signal') or {}).get('keyword_summary', '')}",
-        f"AI 의견: {top.get('ai_verdict', '')}",
-        f"AI 리스크: {top.get('ai_risk', '')}",
-        "",
-        "세부 신호:",
-        f"- 매집: {', '.join(top.get('accumulation_flags', []) or []) if top.get('accumulation_flags') else '특이사항 없음'}",
-        f"- 돌파: {', '.join(top.get('breakout_flags', []) or []) if top.get('breakout_flags') else '특이사항 없음'}",
-        f"- 리스크: {', '.join(top.get('risk_flags', []) or []) if top.get('risk_flags') else '낮음'}",
-        "",
-        f"📰 최근 기사 요약: {top.get('news_summary', '')}",
-        "🗞 최근 기사:",
     ]
-    lines.extend(format_news_lines(top.get("news_items", [])))
 
-    if second:
-        second_name = str(second.get("name", "")).strip() or str(second.get("code", "")).strip()
-        second_market = _market_of(second.get("market", "KOR"))
+    lines.extend(_build_market_leader_block("🇰🇷 국내 1등", top_kor, usdkrw))
+    lines.append("")
+    lines.extend(_build_market_leader_block("🇺🇸 해외 1등", top_us, usdkrw))
+
+    if top_all:
         lines += [
             "",
-            "➕ 차순위 후보",
-            f"{second_name} ({second['code']}) / 시장 {second_market} / 출처 {second.get('candidate_source', '')}",
-            f"단계 {second.get('final_stage', second.get('stage', ''))} / 진입판정 {second.get('entry_decision', '')} / 진입점수 {_safe_int(second.get('entry_score', 0))}",
+            "📰 통합 1등 최근 기사:",
+        ]
+        lines.extend(format_news_lines((top_all or {}).get("news_items", [])))
+        lines += [
+            "",
+            f"AI 의견: {(top_all or {}).get('ai_verdict', '')}",
+            f"AI 리스크: {(top_all or {}).get('ai_risk', '')}",
         ]
 
     lines += [
         "",
-        "제외 기준: 과열 추격, 부정 뉴스, 리스크 과다 종목은 PASS 처리 가능",
         strategy_line,
     ]
 
@@ -509,7 +526,11 @@ def run_report_pipeline(mode: str) -> dict:
     rows = _analyze_candidates(resolved_mode)
     rows, macro = _apply_post_filters(rows, resolved_mode)
 
-    top_tickers = [f"{_market_of(x.get('market', 'KOR'))}:{str(x.get('code', '')).strip()}" for x in rows[:5] if str(x.get("code", "")).strip()]
+    top_tickers = [
+        f"{_market_of(x.get('market', 'KOR'))}:{str(x.get('code', '')).strip()}"
+        for x in rows[:6]
+        if str(x.get("code", "")).strip()
+    ]
     if top_tickers:
         add_recommendations(top_tickers)
 
@@ -531,17 +552,29 @@ def build_report_bundle(mode: str) -> dict:
 
     report_text = build_report_text(rows, macro, resolved_mode, now_text)
 
-    entry_alert_payload = None
-    entry_alert_text = ""
-    if rows:
-        entry_alert_payload = build_entry_alert_payload(rows[0], resolved_mode, now_text)
-        entry_alert_text = build_entry_alert_text(entry_alert_payload)
+    grouped = split_rows_by_market(rows)
+    entry_payloads = []
+    entry_texts = []
+
+    for top in [grouped["top_kor"], grouped["top_us"]]:
+        if not top:
+            continue
+        payload = build_entry_alert_payload(top, resolved_mode, now_text)
+        text = build_entry_alert_text(payload)
+        if text:
+            entry_payloads.append(payload)
+            entry_texts.append(text)
+
+    entry_alert_payload = entry_payloads[0] if entry_payloads else None
+    entry_alert_text = "\n\n--------------------\n\n".join(entry_texts).strip()
 
     return {
         **pipeline,
         "report_text": report_text,
         "entry_alert_payload": entry_alert_payload,
+        "entry_alert_payloads": entry_payloads,
         "entry_alert_text": entry_alert_text,
+        "market_split": grouped,
     }
 
 
