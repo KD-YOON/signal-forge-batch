@@ -1,4 +1,5 @@
 from app.clients.telegram import send_telegram
+from app.services.entry_alerts import sync_report_entry_alerts
 from app.services.reporter import build_report_bundle
 
 
@@ -24,6 +25,12 @@ def main():
         print("entry telegram skipped")
 
     rows = bundle.get("rows", []) or []
+    run_type = str(bundle.get("mode", "") or "").upper()
+    run_id = str(bundle.get("timestamp", "") or "")
+
+    synced = sync_report_entry_alerts(rows=rows, run_type=run_type, run_id=run_id)
+    print("entry alerts synced:", len(synced))
+
     top_code = ""
     top_name = ""
     if rows:
