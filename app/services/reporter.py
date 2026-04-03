@@ -2,7 +2,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from app.clients.gemini import summarize_news
+from app.clients.gemini import review_candidates_with_gemini, summarize_news
 from app.clients.kis import (
     enrich_with_indicators,
     get_access_token,
@@ -33,14 +33,15 @@ NEGATIVE_NEWS_KEYWORDS = [
     "횡령", "배임", "리콜", "규제", "조사", "경고", "목표가 하향", "매도 리포트",
 ]
 
+KST = timezone(timedelta(hours=9))
+
 
 def resolve_mode(mode: str) -> str:
     mode = str(mode or "").strip().lower()
     if mode in ("lunch", "evening", "manual", "morning"):
         return mode
 
-    kst = timezone(timedelta(hours=9))
-    hour = datetime.now(kst).hour
+    hour = datetime.now(KST).hour
     if hour < 11:
         return "morning"
     if hour < 15:
@@ -177,7 +178,14 @@ def _analyze_candidates(resolved_mode: str) -> list[dict]:
         daily = get_domestic_daily_chart(code=code, token=token, days=60)
 
         enriched = enrich_with_indicators(
-            {"code": code, "name": name, "theme": theme, "source": item.get("source", ""), "memo": item.get("memo", "")},
+            {
+                "code": code,
+                "name": name,
+                "theme": theme,
+                "source": item.get("source", ""),
+                "memo": item.get("memo", ""),
+                "market": "KOR",
+            },
             quote,
             daily,
         )
@@ -219,9 +227,21 @@ def _apply_post_filters(rows: list[dict], resolved_mode: str) -> tuple[list[dict
     rows = apply_macro_risk_overlay(rows, macro, resolved_mode)
     rows = [rebuild_stage_after_macro(x) for x in rows]
 
+    market_news_summary = build_market_news_summary(rows)
+    macro_summary = ""
+    if rows:
+        macro_summary = str(rows[0].get("macro_summary", "")).strip()
+
+    rows = review_candidates_with_gemini(
+        rows=rows,
+        run_type=resolved_mode.upper(),
+        market_news_summary=market_news_summary,
+        macro_summary=macro_summary,
+    )
+
     rows.sort(
         key=lambda x: (
-            0 if x.get("entry_decision") == "ENTRY" else 1 if x.get("entry_decision") == "WAIT" else 2,
+            0 if str(x.get("entry_decision", "")).upper() == "ENTRY" else 1 if str(x.get("entry_decision", "")).upper() == "WAIT" else 2,
             -_safe_int(x.get("entry_score", 0)),
             -_safe_int(x.get("quality_score", 0)),
             -_safe_int(x.get("total_score", 0)),
@@ -237,6 +257,7 @@ def build_entry_alert_payload(top: dict, resolved_mode: str, now_text: str) -> d
         "mode": resolved_mode,
         "timestamp": now_text,
         "stage": str(top.get("stage", "")).strip(),
+        "final_stage": str(top.get("final_stage", top.get("stage", ""))).strip(),
         "entry_decision": str(top.get("entry_decision", "")).strip(),
         "entry_reason": str(top.get("entry_reason", "")).strip(),
         "entry_score": _safe_int(top.get("entry_score", 0)),
@@ -261,6 +282,9 @@ def build_entry_alert_payload(top: dict, resolved_mode: str, now_text: str) -> d
         "risk_flags": list(top.get("risk_flags", []) or []),
         "macro_regime": str(top.get("macro_regime", "")),
         "macro_summary": str(top.get("macro_summary", "")),
+        "ai_verdict": str(top.get("ai_verdict", "")).strip(),
+        "ai_risk": str(top.get("ai_risk", "")).strip(),
+        "ai_confidence": _safe_int(top.get("ai_confidence", 0)),
     }
 
 
@@ -274,7 +298,7 @@ def build_entry_alert_text(payload: dict) -> str:
         f"모드: {payload.get('mode', '')}",
         f"시각: {payload.get('timestamp', '')}",
         "",
-        f"단계: {payload.get('stage', '')}",
+        f"단계: {payload.get('final_stage', payload.get('stage', ''))}",
         f"진입판정: {payload.get('entry_decision', '')} (진입점수 {payload.get('entry_score', 0)})",
         f"진입사유: {payload.get('entry_reason', '')}",
         f"제안매수가: {payload.get('proposed_entry', 0):,}원",
@@ -284,6 +308,8 @@ def build_entry_alert_text(payload: dict) -> str:
         "",
         f"뉴스 판정: {payload.get('news_bias', '')}",
         f"뉴스 키워드: {payload.get('news_keywords', '')}",
+        f"AI 의견: {payload.get('ai_verdict', '')}",
+        f"AI 리스크: {payload.get('ai_risk', '')}",
         "메모: 관심구간 접근 후 분할·반등 확인 우선",
     ]
     return "\n".join(lines)
@@ -335,6 +361,7 @@ def build_report_text(rows: list[dict], macro: dict, resolved_mode: str, now_tex
         f"목표가1: {_safe_int(top.get('target1', 0)):,}원 / 목표가2: {_safe_int(top.get('target2', 0)):,}원",
         "",
         f"최종단계: {top.get('stage', '')}",
+        f"AI 최종단계: {top.get('final_stage', top.get('stage', ''))}",
         f"진입판정: {top.get('entry_decision', '')} (진입점수 {_safe_int(top.get('entry_score', 0))})",
         f"진입사유: {top.get('entry_reason', '')}",
         "",
@@ -347,6 +374,8 @@ def build_report_text(rows: list[dict], macro: dict, resolved_mode: str, now_tex
         f"테마: {top.get('theme', '')}",
         f"뉴스 판정: {(top.get('news_signal') or {}).get('bias', '')}",
         f"뉴스 키워드: {(top.get('news_signal') or {}).get('keyword_summary', '')}",
+        f"AI 의견: {top.get('ai_verdict', '')}",
+        f"AI 리스크: {top.get('ai_risk', '')}",
         "",
         "세부 신호:",
         f"- 매집: {', '.join(top.get('accumulation_flags', []) or []) if top.get('accumulation_flags') else '특이사항 없음'}",
@@ -364,7 +393,7 @@ def build_report_text(rows: list[dict], macro: dict, resolved_mode: str, now_tex
             "",
             "➕ 차순위 후보",
             f"{second_name} ({second['code']}) / 출처 {second.get('candidate_source', '')}",
-            f"단계 {second.get('stage', '')} / 진입판정 {second.get('entry_decision', '')} / 진입점수 {_safe_int(second.get('entry_score', 0))}",
+            f"단계 {second.get('final_stage', second.get('stage', ''))} / 진입판정 {second.get('entry_decision', '')} / 진입점수 {_safe_int(second.get('entry_score', 0))}",
         ]
 
     lines += [
@@ -378,7 +407,7 @@ def build_report_text(rows: list[dict], macro: dict, resolved_mode: str, now_tex
 
 def run_report_pipeline(mode: str) -> dict:
     resolved_mode = resolve_mode(mode)
-    now_text = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S")
+    now_text = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
     rows = _analyze_candidates(resolved_mode)
     rows, macro = _apply_post_filters(rows, resolved_mode)
@@ -420,8 +449,5 @@ def build_report_bundle(mode: str) -> dict:
 
 
 def build_report(mode: str) -> str:
-    """
-    기존 jobs.py 호환용
-    """
     bundle = build_report_bundle(mode)
     return bundle["report_text"]
