@@ -178,7 +178,6 @@ def _build_component_scores(item):
     sentiment_adj = 0
     risk_score = 0
 
-    # 추세 정렬
     if ma5 > ma20 > ma60 and price >= ma20:
         accumulation_score += 8
         breakout_score += 10
@@ -198,7 +197,6 @@ def _build_component_scores(item):
         risk_score += 5
         risk_flags.append("가격<60일선")
 
-    # RSI / 반등
     if rsi < 35:
         accumulation_score += 14
         accumulation_flags.append("RSI과매도")
@@ -212,7 +210,6 @@ def _build_component_scores(item):
     if rebound >= 2.0:
         accumulation_score += 4
 
-    # 거래량
     if 110 <= vol_rate <= 220:
         accumulation_score += 6
         breakout_score += 6
@@ -225,7 +222,6 @@ def _build_component_scores(item):
         risk_score += 4
         risk_flags.append("거래량부족")
 
-    # 고점 근접 / 돌파
     if recent_high_20 > 0:
         dist_to_high = ((recent_high_20 - price) / recent_high_20) * 100
         if dist_to_high <= 1.5:
@@ -235,12 +231,10 @@ def _build_component_scores(item):
             breakout_score += 8
             breakout_flags.append("고점접근")
 
-    # 박스권 하단/상단
     if recent_low_20 > 0 and price <= recent_low_20 * 1.04:
         accumulation_score += 6
         accumulation_flags.append("지지권근접")
 
-    # 상승률
     if 0.5 <= change_pct <= 4.5:
         breakout_score += 8
         breakout_flags.append("양호한상승률")
@@ -254,20 +248,40 @@ def _build_component_scores(item):
         risk_score += 6
         risk_flags.append("급락추세")
 
-    # 뉴스 / 감성
+    # 뉴스 점수 스케일 현실화
+    # reporter.py 쪽 score는 대체로 -18 ~ +12 범위에 가까움
     if news_bias == "POSITIVE":
-        sentiment_adj += min(10, max(4, int(abs(news_score) / 2)))
-    elif news_bias == "NEGATIVE":
-        sentiment_adj -= min(12, max(6, int(abs(news_score) / 2)))
-        risk_score += 8
-        risk_flags.append("부정뉴스")
+        if news_score >= 10:
+            sentiment_adj += 10
+        elif news_score >= 6:
+            sentiment_adj += 7
+        elif news_score >= 3:
+            sentiment_adj += 4
+        else:
+            sentiment_adj += 2
 
-    # 테마
+    elif news_bias == "NEGATIVE":
+        if news_score <= -12:
+            sentiment_adj -= 12
+            risk_score += 10
+            risk_flags.append("강한부정뉴스")
+        elif news_score <= -8:
+            sentiment_adj -= 9
+            risk_score += 8
+            risk_flags.append("부정뉴스")
+        elif news_score <= -4:
+            sentiment_adj -= 6
+            risk_score += 6
+            risk_flags.append("약한부정뉴스")
+        else:
+            sentiment_adj -= 3
+            risk_score += 4
+            risk_flags.append("부정뉴스")
+
     for kw in ("ai", "반도체", "데이터센터", "전기차", "플랫폼", "전력", "해운"):
         if kw in theme:
             theme_score += 4
 
-    # 과열
     if rsi >= 80:
         risk_score += 10
         risk_flags.append("RSI과열")
@@ -313,8 +327,6 @@ def compute_weighted_stage_score(
     risk_score=None,
     **kwargs,
 ):
-    # Apps Script computeWeightedStageScore_ 호환:
-    # base 20 + early + breakout + theme + sentimentAdj - 1.3 * risk
     if isinstance(item, dict) and all(
         x is None for x in [early_score, breakout_score, theme_score, sentiment_adj, news_score, risk_score]
     ):
@@ -592,11 +604,21 @@ def _decide_entry_timing(item, comp, total_score, quality_score, stage):
     rsi = _safe_float(item.get("rsi"), 0)
     vol_rate = _safe_float(item.get("vol_rate"), 0)
     change_pct = _safe_float(item.get("change_pct"), 0)
+
     sentiment_score = _safe_float(item.get("news_score"), 0)
-    sentiment_confidence = 60 if abs(sentiment_score) > 0 else 0
     news_bias = str(item.get("news_bias", "NEUTRAL")).upper().strip()
-    news_trade_pass = news_bias == "POSITIVE"
-    sentiment_spike = sentiment_score >= 70 and sentiment_confidence >= 65
+
+    # 현실적인 감성 강도 분기
+    positive_strong = sentiment_score >= 10
+    positive_mid = sentiment_score >= 6
+    positive_light = sentiment_score >= 3
+
+    negative_strong = sentiment_score <= -10
+    negative_mid = sentiment_score <= -6
+    negative_light = sentiment_score <= -3
+
+    news_trade_pass = news_bias == "POSITIVE" and sentiment_score >= 3
+    sentiment_spike = news_bias == "POSITIVE" and sentiment_score >= 10
 
     entry_score = 50
     reason = "중립 구간"
@@ -643,24 +665,33 @@ def _decide_entry_timing(item, comp, total_score, quality_score, stage):
         reason = "현재 진입 매력 낮음"
 
     if news_trade_pass:
-        entry_score += 8
+        entry_score += 6
         reason = "뉴스 매수 필터 통과"
 
-    if sentiment_score >= 70 and sentiment_confidence >= 65:
-        entry_score += 14
-        reason = "감성 강세로 ENTRY 우선권 부여"
-    elif sentiment_score >= 50 and sentiment_confidence >= 55:
+    if positive_strong:
+        entry_score += 12
+        reason = "강한 호재 뉴스로 진입 우선권 부여"
+    elif positive_mid:
         entry_score += 8
-    elif sentiment_score <= -40 and sentiment_confidence >= 50:
+    elif positive_light:
+        entry_score += 4
+
+    if negative_strong:
         entry_score -= 18
-        reason = "부정 감성 강해 진입 보류"
+        reason = "강한 부정 뉴스로 진입 보류"
+    elif negative_mid:
+        entry_score -= 12
+        reason = "부정 뉴스 영향으로 보수 접근"
+    elif negative_light:
+        entry_score -= 6
 
     if sentiment_spike:
-        entry_score += 6
-        reason = "감성 급등으로 단기 모멘텀 우위"
+        entry_score += 5
+        reason = "호재 뉴스 강도가 높아 단기 모멘텀 우위"
 
     if news_bias == "NEGATIVE":
-        entry_score -= 14
+        if negative_strong:
+            entry_score -= 6
         reason = "뉴스 악재 필터에 걸려 보수적 접근"
 
     if rsi >= 80:
@@ -694,8 +725,7 @@ def _decide_entry_timing(item, comp, total_score, quality_score, stage):
         decision = "PASS"
 
     if (
-        sentiment_score >= 70
-        and sentiment_confidence >= 65
+        positive_strong
         and news_trade_pass
         and risk_score <= 16
         and change_pct <= 9
@@ -703,7 +733,7 @@ def _decide_entry_timing(item, comp, total_score, quality_score, stage):
         and stage != "PASS"
     ):
         decision = "ENTRY"
-        reason = "감성 강세 + 뉴스 필터 통과로 즉시 진입 우선"
+        reason = "강한 호재 뉴스 + 필터 통과로 즉시 진입 우선"
 
     if (
         sentiment_spike
@@ -713,7 +743,7 @@ def _decide_entry_timing(item, comp, total_score, quality_score, stage):
         and stage != "PASS"
     ):
         decision = "ENTRY"
-        reason = "감성 급등 + 돌파 준비형 결합"
+        reason = "호재 뉴스 강도 + 돌파 준비형 결합"
 
     if stage == "MOMENTUM_BUY" and change_pct >= 10 and rsi >= 75:
         decision = "PASS"
@@ -723,9 +753,9 @@ def _decide_entry_timing(item, comp, total_score, quality_score, stage):
         decision = "ENTRY"
         reason = "조기 매집형 우수, 선매수 유리"
 
-    if news_bias == "NEGATIVE":
+    if news_bias == "NEGATIVE" and negative_mid:
         decision = "PASS"
-        reason = "부정 뉴스/감성으로 매수 차단"
+        reason = "부정 뉴스 강도가 높아 매수 차단"
 
     return {
         "entry_decision": decision,
