@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 from datetime import datetime
@@ -10,8 +11,9 @@ import requests
 from app.utils import request_with_retry
 
 DEFAULT_BASE_URL = "https://openapi.koreainvestment.com:9443"
+TOKEN_CACHE_FILE = "kis_token_cache.json"
 
-# 실행 프로세스 내 간단 캐시
+# 실행 프로세스 내 캐시
 _TOKEN_CACHE = {
     "token": "",
     "expires_at": 0.0,  # epoch seconds
@@ -26,33 +28,94 @@ def _get_env(name: str, required: bool = True, default: str = "") -> str:
 
 
 def _parse_expiry_seconds(data: dict) -> int:
-    """
-    KIS 응답의 expires_in을 안전하게 파싱
-    """
     try:
         return int(float(data.get("expires_in", 0) or 0))
     except Exception:
         return 0
 
 
-def get_access_token(force_refresh: bool = False) -> str:
+def _load_token_cache_file() -> dict:
+    if not os.path.exists(TOKEN_CACHE_FILE):
+        return {}
+
+    try:
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception as e:
+        print("[KIS DEBUG] token cache load failed", str(e))
+
+    return {}
+
+
+def _save_token_cache_file(token: str, expires_at: float) -> None:
+    payload = {
+        "access_token": token,
+        "expires_at": expires_at,
+        "saved_at": time.time(),
+    }
+
+    try:
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except Exception as e:
+        print("[KIS DEBUG] token cache save failed", str(e))
+
+
+def _get_valid_cached_token(buffer_sec: int = 300) -> str:
     """
-    토큰 요청은 공통 request_with_retry를 그대로 쓰지 않고 별도 처리한다.
-    이유:
-    - 403이어도 응답 body를 먼저 확인해야 하는 경우가 있음
-    - access_token이 body에 들어오면 상태코드보다 실사용 가능성이 더 중요함
+    1) 메모리 캐시 확인
+    2) 파일 캐시 확인
+    buffer_sec 이내 만료 예정이면 재발급
     """
     global _TOKEN_CACHE
 
     now_ts = time.time()
 
-    # 만료 60초 전까지는 재사용
-    if (
-        not force_refresh
-        and _TOKEN_CACHE["token"]
-        and _TOKEN_CACHE["expires_at"] > now_ts + 60
-    ):
-        return _TOKEN_CACHE["token"]
+    # 1. 메모리 캐시
+    mem_token = str(_TOKEN_CACHE.get("token", "") or "").strip()
+    mem_exp = float(_TOKEN_CACHE.get("expires_at", 0) or 0)
+    if mem_token and mem_exp > now_ts + buffer_sec:
+        print("[KIS DEBUG] token source = memory_cache")
+        return mem_token
+
+    # 2. 파일 캐시
+    cached = _load_token_cache_file()
+    file_token = str(cached.get("access_token", "") or "").strip()
+    file_exp = float(cached.get("expires_at", 0) or 0)
+
+    if file_token and file_exp > now_ts + buffer_sec:
+        _TOKEN_CACHE["token"] = file_token
+        _TOKEN_CACHE["expires_at"] = file_exp
+        print("[KIS DEBUG] token source = file_cache")
+        return file_token
+
+    return ""
+
+
+def _set_cached_token(token: str, expires_in: int) -> None:
+    global _TOKEN_CACHE
+
+    if expires_in <= 0:
+        expires_in = 60 * 60 * 6  # 비정상 응답 대비 보수적 기본값 6시간
+
+    expires_at = time.time() + expires_in
+
+    _TOKEN_CACHE["token"] = token
+    _TOKEN_CACHE["expires_at"] = expires_at
+    _save_token_cache_file(token, expires_at)
+
+
+def get_access_token(force_refresh: bool = False) -> str:
+    """
+    토큰 요청은 상태코드보다 응답 body를 먼저 확인한다.
+    또한 파일 캐시를 사용해 실행 간 재사용을 시도한다.
+    """
+    if not force_refresh:
+        cached_token = _get_valid_cached_token(buffer_sec=300)
+        if cached_token:
+            return cached_token
 
     app_key = _get_env("KIS_APP_KEY")
     app_secret = _get_env("KIS_APP_SECRET")
@@ -71,6 +134,7 @@ def get_access_token(force_refresh: bool = False) -> str:
             "base_url": base_url,
             "app_key_prefix": app_key[:6] if app_key else "",
             "app_secret_prefix": app_secret[:6] if app_secret else "",
+            "force_refresh": force_refresh,
         },
     )
 
@@ -96,14 +160,10 @@ def get_access_token(force_refresh: bool = False) -> str:
             token = data.get("access_token", "") if isinstance(data, dict) else ""
             if token:
                 expires_in = _parse_expiry_seconds(data)
-                if expires_in <= 0:
-                    expires_in = 60 * 60 * 6  # 비정상 응답 대비 보수적 기본값 6시간
-
-                _TOKEN_CACHE["token"] = token
-                _TOKEN_CACHE["expires_at"] = time.time() + expires_in
+                _set_cached_token(token, expires_in)
+                print("[KIS DEBUG] token source = issued_new")
                 return token
 
-            # body에 token이 없으면 그때 상태코드와 본문 기반으로 실패 처리
             if resp.status_code >= 400:
                 last_error = RuntimeError(
                     f"KIS token HTTP {resp.status_code}: {(resp.text or '')[:300]}"
@@ -213,9 +273,6 @@ def get_domestic_daily_chart(code: str, token: str, days: int = 30) -> list[dict
 
 
 def get_domestic_volume_rank_candidates(token: str, limit: int = 40) -> list[dict]:
-    """
-    거래량 랭킹 후보 조회
-    """
     base_url = _get_env("KIS_BASE_URL", required=False, default=DEFAULT_BASE_URL)
     url = f"{base_url}/uapi/domestic-stock/v1/quotations/volume-rank"
     params = {
