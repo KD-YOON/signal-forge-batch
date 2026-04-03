@@ -1,3 +1,4 @@
+# === app/services/reporter.py START ===
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -16,7 +17,6 @@ from app.services.signals import (
     compute_weighted_stage_score,
     decide_stage_label,
 )
-
 from app.recent_cache import get_recent_tickers, add_recommendations
 
 
@@ -137,7 +137,20 @@ def rebuild_stage_after_macro(item: dict) -> dict:
 def build_report(mode: str) -> str:
     resolved_mode = resolve_mode(mode)
     now = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1) 후보 수집
     candidates = get_combined_candidates()
+
+    # 2) 최근 추천 종목 제외
+    recent = get_recent_tickers(days=3)
+    filtered_candidates = []
+    for c in candidates:
+        ticker = str(c.get("code", "")).strip()
+        if ticker in recent:
+            continue
+        filtered_candidates.append(c)
+    candidates = filtered_candidates
+
     analyze_limit = int(os.getenv("ANALYZE_TOP_N", "8") or "8")
     candidates = candidates[:max(1, analyze_limit)]
 
@@ -154,7 +167,11 @@ def build_report(mode: str) -> str:
 
         quote = get_domestic_current_price(code=code, token=token)
         daily = get_domestic_daily_chart(code=code, token=token, days=30)
-        enriched = enrich_with_indicators({"code": code, "name": name, "theme": theme, "source": item.get("source", "")}, quote, daily)
+        enriched = enrich_with_indicators(
+            {"code": code, "name": name, "theme": theme, "source": item.get("source", "")},
+            quote,
+            daily,
+        )
 
         news_items = get_news(name, limit=2)
         news_summary = summarize_news(name, news_items)
@@ -162,15 +179,28 @@ def build_report(mode: str) -> str:
 
         stage_info = analyze_stage_signals(enriched, quote, daily, news_signal)
 
-        analyzed.append({
-            **enriched,
-            **stage_info,
-            "candidate_source": item.get("source", ""),
-            "candidate_memo": item.get("memo", ""),
-            "news_items": news_items,
-            "news_summary": news_summary,
-            "news_signal": news_signal,
-        })
+        analyzed.append(
+            {
+                **enriched,
+                **stage_info,
+                "candidate_source": item.get("source", ""),
+                "candidate_memo": item.get("memo", ""),
+                "news_items": news_items,
+                "news_summary": news_summary,
+                "news_signal": news_signal,
+            }
+        )
+
+    # 3) 분석 결과 중복 제거
+    seen = set()
+    unique_analyzed = []
+    for row in analyzed:
+        code = str(row.get("code", "")).strip()
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        unique_analyzed.append(row)
+    analyzed = unique_analyzed
 
     macro = get_macro_snapshot()
     analyzed = apply_macro_risk_overlay(analyzed, macro, resolved_mode)
@@ -186,6 +216,11 @@ def build_report(mode: str) -> str:
             -x["total_score"],
         )
     )
+
+    # 4) 최근 추천 종목 기록 저장
+    top_tickers = [str(x.get("code", "")).strip() for x in analyzed[:5] if str(x.get("code", "")).strip()]
+    if top_tickers:
+        add_recommendations(top_tickers)
 
     top = analyzed[0]
     second = analyzed[1] if len(analyzed) > 1 else None
@@ -267,3 +302,4 @@ def build_report(mode: str) -> str:
     ]
 
     return "\n".join(lines)
+# === app/services/reporter.py END ===
