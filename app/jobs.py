@@ -91,7 +91,7 @@ def extract_entry_alerts(report_text: str) -> str:
         "메모: 관심구간 접근 후 분할·반등 확인 우선",
     ]
 
-    return "\\n".join(alert_lines)
+    return "\n".join(alert_lines)
 
 
 def main():
