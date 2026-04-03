@@ -288,28 +288,73 @@ def compute_weighted_stage_score(
     return round(max(0, min(100, total)), 1)
 
 
-def decide_stage_label(item=None, **kwargs):
-    if isinstance(item, dict) and not kwargs:
-        total_score = compute_weighted_stage_score(item=item)
-        rsi = _safe_float(item.get("rsi"), 50)
-        risk_score = _safe_float(_build_component_scores(_normalize_item(item))["risk_score"], 0)
-    else:
-        total_score = _safe_float(kwargs.get("total_score", item), 0)
-        rsi = _safe_float(kwargs.get("rsi"), 50)
-        risk_score = _safe_float(kwargs.get("risk_score"), 0)
+def decide_stage_label(
+    item=None,
+    early_score=None,
+    breakout_score=None,
+    risk_score=None,
+    theme_score=None,
+    total_score=None,
+    rsi=None,
+    vol_rate=None,
+    **kwargs,
+):
+    # 1) reporter.py에서 개별 점수 인자로 호출하는 경우
+    if any(v is not None for v in [early_score, breakout_score, risk_score, theme_score, total_score, rsi, vol_rate]):
+        total = _safe_float(total_score, 0)
+        risk = _safe_float(risk_score, 0)
+        rsi_val = _safe_float(rsi, 50)
+        vol_val = _safe_float(vol_rate, 0)
+        early = _safe_float(early_score, 0)
+        breakout = _safe_float(breakout_score, 0)
 
-    if risk_score >= 18 and total_score < 55:
-        return "과열주의"
-    if total_score >= 80:
+        if risk >= 18 and total < 55:
+            return "과열주의"
+        if total >= 85:
+            return "강매수"
+        if total >= 70:
+            return "매수관심"
+        if total >= 55:
+            return "관심"
+        if early >= 15 and breakout >= 10 and risk <= 12:
+            return "바닥탐색"
+        if rsi_val < 35 and vol_val >= 100:
+            return "반등대기"
+        return "관망"
+
+    # 2) item dict로 호출하는 경우
+    if isinstance(item, dict):
+        total = compute_weighted_stage_score(item=item)
+        comp = _build_component_scores(_normalize_item(item))
+        risk = _safe_float(comp.get("risk_score"), 0)
+        rsi_val = _safe_float(item.get("rsi"), 50)
+        vol_val = _safe_float(item.get("vol_rate"), 0)
+        early = _safe_float(comp.get("accumulation_score"), 0)
+        breakout = _safe_float(comp.get("breakout_score"), 0)
+
+        if risk >= 18 and total < 55:
+            return "과열주의"
+        if total >= 85:
+            return "강매수"
+        if total >= 70:
+            return "매수관심"
+        if total >= 55:
+            return "관심"
+        if early >= 15 and breakout >= 10 and risk <= 12:
+            return "바닥탐색"
+        if rsi_val < 35 and vol_val >= 100:
+            return "반등대기"
+        return "관망"
+
+    # 3) 숫자 하나만 들어온 경우
+    total = _safe_float(item, 0)
+    if total >= 85:
         return "강매수"
-    if total_score >= 65:
+    if total >= 70:
         return "매수관심"
-    if total_score >= 50:
+    if total >= 55:
         return "관심"
-    if rsi < 35:
-        return "바닥탐색"
     return "관망"
-
 
 def build_stage_comment(item):
     normalized = _normalize_item(item)
