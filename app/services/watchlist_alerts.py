@@ -157,7 +157,7 @@ def get_watchlist_action_text(signal: str, strategy: str = "") -> str:
     strat = str(strategy or "").strip().upper()
 
     if sig == "BREAKOUT_WAIT":
-        return "전고 돌파 재확인 후 접근"
+        return "돌파 재확인 후 접근"
     if sig == "PULLBACK_WAIT":
         return "눌림 유지 후 반등 확인"
     if sig == "SUPPORT_CHECK":
@@ -169,6 +169,8 @@ def get_watchlist_action_text(signal: str, strategy: str = "") -> str:
         return "돌파 조건 대기"
     if strat == "PULLBACK":
         return "눌림 조건 대기"
+    if strat == "SUPPORT":
+        return "지지 조건 대기"
     return "조건 재확인 후 판단"
 
 
@@ -188,23 +190,42 @@ def _parse_watchlist_rows() -> list[dict]:
     for idx, row in enumerate(data, start=1):
         if not isinstance(row, dict):
             continue
+
         market = _market_of(row.get("market", "KOR"))
         code = _normalize_code(row.get("code", ""), market)
         if not code:
             continue
+
         use_yn = str(row.get("use", row.get("useYn", "Y"))).strip().upper()
         if use_yn != "Y":
             continue
+
+        breakout_price = _safe_float(row.get("breakout_price", row.get("anchor_price", 0)), 0.0)
+        support_price = _safe_float(row.get("support_price", 0), 0.0)
+        pullback_price = _safe_float(row.get("pullback_price", row.get("anchor_price", 0)), 0.0)
+
+        strategy = str(row.get("strategy", row.get("entry_strategy", ""))).strip().upper()
+        if not strategy:
+            if breakout_price > 0:
+                strategy = "BREAKOUT"
+            elif pullback_price > 0:
+                strategy = "PULLBACK"
+            elif support_price > 0:
+                strategy = "SUPPORT"
 
         out.append(
             {
                 "market": market,
                 "code": code,
                 "name": str(row.get("name", code)).strip() or code,
-                "strategy": str(row.get("strategy", row.get("entry_strategy", ""))).strip().upper(),
+                "strategy": strategy,
                 "trigger_text": str(row.get("trigger", row.get("entry_trigger", ""))).strip(),
                 "memo": str(row.get("memo", "")).strip(),
                 "rank": idx,
+                "breakout_price": breakout_price,
+                "support_price": support_price,
+                "pullback_price": pullback_price,
+                "anchor_price": _safe_float(row.get("anchor_price", 0), 0.0),
             }
         )
     return out
@@ -236,7 +257,10 @@ def sync_watchlist_alerts() -> list[dict]:
             "fx_value": fx_value if market == "US" else 1.0,
             "current_price": _safe_float(prev.get("current_price", 0)),
             "prev_close": _safe_float(prev.get("prev_close", 0)),
-            "anchor_price": _safe_float(prev.get("anchor_price", 0)),
+            "anchor_price": _safe_float(item.get("anchor_price", prev.get("anchor_price", 0))),
+            "breakout_price": _safe_float(item.get("breakout_price", prev.get("breakout_price", 0))),
+            "support_price": _safe_float(item.get("support_price", prev.get("support_price", 0))),
+            "pullback_price": _safe_float(item.get("pullback_price", prev.get("pullback_price", 0))),
             "gap_pct": _safe_float(prev.get("gap_pct", 0)),
             "rsi": _safe_float(prev.get("rsi", 0)),
             "vol_rate": _safe_float(prev.get("vol_rate", 0)),
@@ -265,6 +289,9 @@ def build_watchlist_alert_telegram_message(payload: dict) -> str:
         f"현재가: {_format_price_with_krw(payload.get('current_price', 0), market, fx_value)}",
         f"전일종가: {_format_price_with_krw(payload.get('prev_close', 0), market, fx_value)}",
         f"기준가: {_format_price(payload.get('anchor_price', 0), market)}",
+        f"돌파가: {_format_price(payload.get('breakout_price', 0), market)}",
+        f"눌림가: {_format_price(payload.get('pullback_price', 0), market)}",
+        f"지지가: {_format_price(payload.get('support_price', 0), market)}",
         f"괴리율: {_safe_float(payload.get('gap_pct', 0)):.2f}%",
         "",
         f"전략: {payload.get('strategy', '')}",
@@ -280,6 +307,35 @@ def build_watchlist_alert_telegram_message(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def _pick_anchor_price(row: dict, strategy: str, prev_close: float, price: float) -> float:
+    breakout_price = _safe_float(row.get("breakout_price", 0), 0.0)
+    support_price = _safe_float(row.get("support_price", 0), 0.0)
+    pullback_price = _safe_float(row.get("pullback_price", 0), 0.0)
+    anchor_price = _safe_float(row.get("anchor_price", 0), 0.0)
+
+    if strategy == "BREAKOUT":
+        if breakout_price > 0:
+            return breakout_price
+        if anchor_price > 0:
+            return anchor_price
+    elif strategy == "PULLBACK":
+        if pullback_price > 0:
+            return pullback_price
+        if anchor_price > 0:
+            return anchor_price
+    elif strategy == "SUPPORT":
+        if support_price > 0:
+            return support_price
+        if anchor_price > 0:
+            return anchor_price
+
+    if anchor_price > 0:
+        return anchor_price
+    if prev_close > 0:
+        return prev_close
+    return price
+
+
 def _evaluate_watch_signal(row: dict, quote: dict) -> tuple[str, float, float, str, str]:
     strategy = str(row.get("strategy", "")).strip().upper()
 
@@ -291,30 +347,38 @@ def _evaluate_watch_signal(row: dict, quote: dict) -> tuple[str, float, float, s
     if price <= 0:
         return "WAIT", 0.0, 0.0, "", ""
 
-    anchor_price = prev_close if prev_close > 0 else price
+    anchor_price = _pick_anchor_price(row, strategy, prev_close, price)
     gap_pct = ((price - anchor_price) / anchor_price) * 100 if anchor_price > 0 else 0.0
 
     chase = (
-        abs(gap_pct) >= CHASE_GAP_PCT
+        gap_pct >= CHASE_GAP_PCT
         or _safe_float(quote.get("change_pct", 0), 0.0) >= HOT_CHANGE_PCT
         or rsi >= HOT_RSI
         or vol_rate >= HOT_VOL_RATE
     )
-    if chase and gap_pct > 0:
-        return "CHASE_BLOCK", anchor_price, gap_pct, "급등/과열 구간으로 추격 주의", get_watchlist_action_text("CHASE_BLOCK", strategy)
+    if chase:
+        return "CHASE_BLOCK", anchor_price, gap_pct, "기준가 대비 급등/과열 구간", get_watchlist_action_text("CHASE_BLOCK", strategy)
 
     if strategy == "BREAKOUT":
-        if anchor_price > 0 and price >= anchor_price * (1.0 + BREAKOUT_BUFFER_PCT / 100.0):
-            return "BREAKOUT_WAIT", anchor_price, gap_pct, "기준가 상향 돌파 확인", get_watchlist_action_text("BREAKOUT_WAIT", strategy)
-        return "WAIT", anchor_price, gap_pct, "돌파 조건 대기", get_watchlist_action_text("", strategy)
+        breakout_price = _safe_float(row.get("breakout_price", 0), 0.0) or anchor_price
+        if breakout_price > 0 and price >= breakout_price * (1.0 + BREAKOUT_BUFFER_PCT / 100.0):
+            return "BREAKOUT_WAIT", breakout_price, ((price - breakout_price) / breakout_price) * 100, "지정 돌파가 상향 돌파 확인", get_watchlist_action_text("BREAKOUT_WAIT", strategy)
+        return "WAIT", breakout_price, ((price - breakout_price) / breakout_price) * 100 if breakout_price > 0 else 0.0, "돌파 조건 대기", get_watchlist_action_text("", strategy)
 
     if strategy == "PULLBACK":
-        if anchor_price > 0 and price <= anchor_price * (1.0 + PULLBACK_BUFFER_PCT / 100.0):
-            return "PULLBACK_WAIT", anchor_price, gap_pct, "기준가 부근 눌림 구간 진입", get_watchlist_action_text("PULLBACK_WAIT", strategy)
-        return "WAIT", anchor_price, gap_pct, "눌림 조건 대기", get_watchlist_action_text("", strategy)
+        pullback_price = _safe_float(row.get("pullback_price", 0), 0.0) or anchor_price
+        if pullback_price > 0 and price <= pullback_price * (1.0 + PULLBACK_BUFFER_PCT / 100.0):
+            return "PULLBACK_WAIT", pullback_price, ((price - pullback_price) / pullback_price) * 100, "지정 눌림가 부근 진입", get_watchlist_action_text("PULLBACK_WAIT", strategy)
+        return "WAIT", pullback_price, ((price - pullback_price) / pullback_price) * 100 if pullback_price > 0 else 0.0, "눌림 조건 대기", get_watchlist_action_text("", strategy)
+
+    if strategy == "SUPPORT":
+        support_price = _safe_float(row.get("support_price", 0), 0.0) or anchor_price
+        if support_price > 0 and price <= support_price * (1.0 + SUPPORT_BUFFER_PCT / 100.0):
+            return "SUPPORT_CHECK", support_price, ((price - support_price) / support_price) * 100, "지정 지지선 재테스트 구간", get_watchlist_action_text("SUPPORT_CHECK", strategy)
+        return "WAIT", support_price, ((price - support_price) / support_price) * 100 if support_price > 0 else 0.0, "지지 조건 대기", get_watchlist_action_text("", strategy)
 
     if anchor_price > 0 and price <= anchor_price * (1.0 + SUPPORT_BUFFER_PCT / 100.0):
-        return "SUPPORT_CHECK", anchor_price, gap_pct, "지지권 재테스트 구간", get_watchlist_action_text("SUPPORT_CHECK", strategy)
+        return "SUPPORT_CHECK", anchor_price, gap_pct, "기준 지지권 재테스트", get_watchlist_action_text("SUPPORT_CHECK", strategy)
 
     return "WAIT", anchor_price, gap_pct, "조건 대기", get_watchlist_action_text("", strategy)
 
