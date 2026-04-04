@@ -5,10 +5,9 @@ import os
 import time
 from datetime import datetime
 from statistics import mean
+from typing import Any
 
 import requests
-
-from app.utils import request_with_retry
 
 DEFAULT_BASE_URL = "https://openapi.koreainvestment.com:9443"
 DEFAULT_TOKEN_CACHE_FILE = "kis_token_cache.json"
@@ -251,7 +250,7 @@ def _set_cached_token(token: str, expires_in: int) -> None:
 
 def clear_cached_token() -> None:
     """
-    수동 점검용. 필요 시 강제 초기화에 사용.
+    만료/오염 토큰 제거용.
     """
     global _TOKEN_CACHE
     _TOKEN_CACHE["token"] = ""
@@ -367,6 +366,178 @@ def _normalize_code(code: str) -> str:
     return raw.zfill(6)
 
 
+def _looks_like_kis_auth_error(status_code: int, data: Any, text: str) -> bool:
+    """
+    KIS 인증 만료/무효 토큰으로 의심되는 응답 판별.
+    정확한 코드가 환경별로 다를 수 있어 다중 신호로 판정한다.
+    """
+    if status_code in (401, 403):
+        return True
+
+    if isinstance(data, dict):
+        joined = " ".join(
+            [
+                str(data.get("msg_cd", "") or ""),
+                str(data.get("msg1", "") or ""),
+                str(data.get("message", "") or ""),
+                str(data.get("error_description", "") or ""),
+                str(data.get("error", "") or ""),
+                str(data.get("rt_cd", "") or ""),
+            ]
+        ).lower()
+
+        auth_keywords = [
+            "access token",
+            "token",
+            "expired",
+            "expire",
+            "auth",
+            "authorization",
+            "unauthorized",
+            "forbidden",
+            "기간이 만료",
+            "토큰",
+            "인증",
+            "접근토큰",
+        ]
+        if any(keyword in joined for keyword in auth_keywords):
+            return True
+
+    text_l = (text or "").lower()
+    if any(keyword in text_l for keyword in ["access token", "expired token", "unauthorized", "forbidden"]):
+        return True
+
+    return False
+
+
+def _raise_for_kis_error(resp: requests.Response, data: Any) -> None:
+    """
+    인증 외 일반 오류를 호출부에서 명확히 보이도록 예외화.
+    """
+    if resp.status_code >= 400:
+        body_preview = (resp.text or "")[:500]
+        raise RuntimeError(f"KIS HTTP {resp.status_code}: {body_preview}")
+
+    if isinstance(data, dict):
+        rt_cd = str(data.get("rt_cd", "") or "").strip()
+        msg_cd = str(data.get("msg_cd", "") or "").strip()
+        msg1 = str(data.get("msg1", "") or data.get("message", "") or "").strip()
+
+        # 정상 응답이면서 output/output2가 있는 경우는 통과
+        if "output" in data or "output2" in data:
+            return
+
+        # KIS는 rt_cd='0' 정상인 경우가 많음
+        if rt_cd and rt_cd != "0":
+            raise RuntimeError(f"KIS API error rt_cd={rt_cd} msg_cd={msg_cd} msg={msg1}")
+
+        # output/output2가 없고 msg가 강하게 오면 실패로 간주
+        if msg_cd or msg1:
+            if not any(k in data for k in ["output", "output1", "output2"]):
+                raise RuntimeError(f"KIS API error msg_cd={msg_cd} msg={msg1}")
+
+
+def request_with_retry(
+    method: str,
+    url: str,
+    *,
+    headers: dict | None = None,
+    params: dict | None = None,
+    json_data: dict | None = None,
+    data: Any = None,
+    timeout: int = 30,
+    max_retries: int = 3,
+    allow_token_refresh: bool = True,
+) -> requests.Response:
+    """
+    공통 요청 레이어
+
+    기능:
+    - 네트워크 오류 재시도
+    - 5xx 재시도
+    - KIS 인증 만료/무효 토큰 응답 감지
+    - 캐시 삭제 후 토큰 강제 재발급
+    - 동일 요청 1회 재실행
+    """
+    session = requests.Session()
+    last_error = None
+    token_refresh_used = False
+
+    for attempt in range(max_retries):
+        try:
+            req_headers = dict(headers or {})
+
+            resp = session.request(
+                method=method.upper(),
+                url=url,
+                headers=req_headers,
+                params=params,
+                json=json_data,
+                data=data,
+                timeout=timeout,
+            )
+
+            parsed = None
+            try:
+                parsed = resp.json()
+            except Exception:
+                parsed = None
+
+            # 1) 인증 만료/무효 토큰 감지 -> 1회만 자동 복구
+            if allow_token_refresh and not token_refresh_used:
+                if _looks_like_kis_auth_error(resp.status_code, parsed, resp.text):
+                    print("[KIS DEBUG] auth error detected -> refresh token and retry once")
+                    clear_cached_token()
+                    new_token = get_access_token(force_refresh=True)
+
+                    retried_headers = dict(req_headers)
+                    retried_headers["authorization"] = f"Bearer {new_token}"
+
+                    token_refresh_used = True
+                    resp = session.request(
+                        method=method.upper(),
+                        url=url,
+                        headers=retried_headers,
+                        params=params,
+                        json=json_data,
+                        data=data,
+                        timeout=timeout,
+                    )
+                    return resp
+
+            # 2) 서버 일시 오류 재시도
+            if resp.status_code >= 500:
+                body_preview = (resp.text or "")[:300]
+                last_error = RuntimeError(f"KIS server error HTTP {resp.status_code}: {body_preview}")
+                if attempt < max_retries - 1:
+                    time.sleep(attempt + 1)
+                    continue
+                raise last_error
+
+            # 3) 일반 실패는 즉시 예외화
+            _raise_for_kis_error(resp, parsed)
+            return resp
+
+        except requests.RequestException as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(attempt + 1)
+                continue
+            raise
+
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(attempt + 1)
+                continue
+            raise
+
+    if last_error:
+        raise last_error
+
+    raise RuntimeError("request_with_retry failed without specific error")
+
+
 def get_domestic_current_price(code: str, token: str) -> dict:
     base_url = _get_env("KIS_BASE_URL", required=False, default=DEFAULT_BASE_URL)
     url = f"{base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
@@ -382,7 +553,7 @@ def get_domestic_current_price(code: str, token: str) -> dict:
         params=params,
     )
     data = resp.json()
-    out = data.get("output", {})
+    out = data.get("output", {}) if isinstance(data, dict) else {}
 
     kis_name = (
         str(out.get("hts_kor_isnm", "") or "").strip()
@@ -424,7 +595,7 @@ def get_domestic_daily_chart(code: str, token: str, days: int = 30) -> list[dict
         params=params,
     )
     data = resp.json()
-    rows = data.get("output2", [])[:days]
+    rows = data.get("output2", [])[:days] if isinstance(data, dict) else []
 
     out = []
     for row in rows:
@@ -464,7 +635,7 @@ def get_domestic_volume_rank_candidates(token: str, limit: int = 40) -> list[dic
         params=params,
     )
     data = resp.json()
-    rows = data.get("output", [])[: max(1, min(limit, 100))]
+    rows = data.get("output", [])[: max(1, min(limit, 100))] if isinstance(data, dict) else []
 
     out = []
     for idx, row in enumerate(rows, start=1):
