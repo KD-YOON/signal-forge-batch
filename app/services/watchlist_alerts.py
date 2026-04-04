@@ -12,6 +12,8 @@ from app.services.macro import get_macro_snapshot
 
 
 WATCHLIST_ALERTS_FILE = os.getenv("WATCHLIST_ALERTS_FILE", "watchlist_alerts.json").strip() or "watchlist_alerts.json"
+AUTO_WATCHLIST_MAX = int(float(os.getenv("AUTO_WATCHLIST_MAX", "6") or 6))
+AUTO_WATCHLIST_SOURCE = os.getenv("AUTO_WATCHLIST_SOURCE", "REPORT_TOP").strip() or "REPORT_TOP"
 KST = timezone(timedelta(hours=9))
 
 WATCH_COOLDOWN_MIN = int(float(os.getenv("WATCHLIST_ALERT_COOLDOWN_MIN", "180") or 180))
@@ -174,7 +176,7 @@ def get_watchlist_action_text(signal: str, strategy: str = "") -> str:
     return "조건 재확인 후 판단"
 
 
-def _parse_watchlist_rows() -> list[dict]:
+def _parse_manual_watchlist_rows() -> list[dict]:
     raw = os.getenv("WATCHLIST_JSON", "").strip()
     if not raw:
         return []
@@ -222,6 +224,7 @@ def _parse_watchlist_rows() -> list[dict]:
                 "trigger_text": str(row.get("trigger", row.get("entry_trigger", ""))).strip(),
                 "memo": str(row.get("memo", "")).strip(),
                 "rank": idx,
+                "source_type": "MANUAL",
                 "breakout_price": breakout_price,
                 "support_price": support_price,
                 "pullback_price": pullback_price,
@@ -231,8 +234,145 @@ def _parse_watchlist_rows() -> list[dict]:
     return out
 
 
+def _build_auto_strategy(row: dict) -> tuple[str, float, float, float, float, str]:
+    stage = str(row.get("final_stage", row.get("stage", ""))).strip().upper()
+    name = str(row.get("name", row.get("code", ""))).strip()
+    code = str(row.get("code", "")).strip()
+    market = _market_of(row.get("market", "KOR"))
+
+    proposed_entry = _safe_float(row.get("proposed_entry", 0), 0.0)
+    zone_low = _safe_float(row.get("entry_zone_low", 0), 0.0)
+    zone_high = _safe_float(row.get("entry_zone_high", 0), 0.0)
+    stop_loss = _safe_float(row.get("stop_loss", 0), 0.0)
+
+    strategy = "PULLBACK"
+    trigger_text = "리포트 상위종목 자동감시"
+
+    if stage == "BREAKOUT_READY":
+        strategy = "BREAKOUT"
+        breakout_price = zone_high if zone_high > 0 else proposed_entry
+        anchor_price = breakout_price
+        pullback_price = proposed_entry if proposed_entry > 0 else zone_low
+        support_price = stop_loss if stop_loss > 0 else zone_low
+        trigger_text = f"{name} 돌파 준비형 자동감시"
+    elif stage == "EARLY_ACCUMULATION":
+        strategy = "PULLBACK"
+        breakout_price = zone_high if zone_high > 0 else 0.0
+        anchor_price = proposed_entry if proposed_entry > 0 else zone_low
+        pullback_price = anchor_price
+        support_price = zone_low if zone_low > 0 else stop_loss
+        trigger_text = f"{name} 눌림형 자동감시"
+    else:
+        strategy = "SUPPORT"
+        breakout_price = zone_high if zone_high > 0 else 0.0
+        anchor_price = proposed_entry if proposed_entry > 0 else zone_low
+        pullback_price = proposed_entry if proposed_entry > 0 else 0.0
+        support_price = stop_loss if stop_loss > 0 else zone_low
+        trigger_text = f"{name} 지지형 자동감시"
+
+    return strategy, anchor_price, breakout_price, pullback_price, support_price, trigger_text
+
+
+def build_auto_watchlist_from_rows(rows: list[dict], run_type: str = "", run_id: str = "") -> list[dict]:
+    if not rows:
+        return []
+
+    selected = []
+    sorted_rows = sorted(
+        rows,
+        key=lambda x: (
+            0 if str(x.get("entry_decision", "")).upper() == "ENTRY" else 1,
+            -_safe_int(x.get("entry_score", 0)),
+            -_safe_int(x.get("quality_score", 0)),
+            -_safe_int(x.get("total_score", 0)),
+        ),
+    )
+
+    seen: set[str] = set()
+    for row in sorted_rows:
+        market = _market_of(row.get("market", "KOR"))
+        code = _normalize_code(row.get("code", ""), market)
+        if not code:
+            continue
+        key = f"{market}:{code}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        strategy, anchor_price, breakout_price, pullback_price, support_price, trigger_text = _build_auto_strategy(row)
+        selected.append(
+            {
+                "market": market,
+                "code": code,
+                "name": str(row.get("name", code)).strip() or code,
+                "strategy": strategy,
+                "trigger_text": trigger_text,
+                "memo": f"{AUTO_WATCHLIST_SOURCE} {str(run_type or '').upper()} {str(run_id or '')}".strip(),
+                "rank": len(selected) + 1,
+                "source_type": "AUTO",
+                "anchor_price": anchor_price,
+                "breakout_price": breakout_price,
+                "pullback_price": pullback_price,
+                "support_price": support_price,
+                "entry_decision": str(row.get("entry_decision", "")).strip(),
+                "final_stage": str(row.get("final_stage", row.get("stage", ""))).strip(),
+                "entry_score": _safe_int(row.get("entry_score", 0)),
+                "quality_score": _safe_int(row.get("quality_score", 0)),
+                "total_score": _safe_int(row.get("total_score", 0)),
+                "run_type": str(run_type or "").upper(),
+                "run_id": str(run_id or ""),
+                "saved_at": _now_text(),
+            }
+        )
+        if len(selected) >= AUTO_WATCHLIST_MAX:
+            break
+
+    return selected
+
+
+def sync_auto_watchlist_from_rows(rows: list[dict], run_type: str = "", run_id: str = "") -> list[dict]:
+    auto_rows = build_auto_watchlist_from_rows(rows=rows, run_type=run_type, run_id=run_id)
+    existing = _load_json_file(WATCHLIST_ALERTS_FILE)
+
+    # 기존 MANUAL은 유지, AUTO만 교체
+    manual_rows = [x for x in existing if str(x.get("source_type", "MANUAL")).upper() != "AUTO"]
+    merged = manual_rows + auto_rows
+    _save_json_file(WATCHLIST_ALERTS_FILE, merged)
+    return merged
+
+
+def _merge_watchlists() -> list[dict]:
+    manual_rows = _parse_manual_watchlist_rows()
+    stored_rows = _load_json_file(WATCHLIST_ALERTS_FILE)
+
+    # stored_rows에는 AUTO 또는 과거 MANUAL 상태값이 들어 있을 수 있음
+    manual_map = {f"{_market_of(x.get('market'))}:{_normalize_code(x.get('code', ''), _market_of(x.get('market')))}": x for x in manual_rows}
+    stored_map = {f"{_market_of(x.get('market'))}:{_normalize_code(x.get('code', ''), _market_of(x.get('market')))}": x for x in stored_rows}
+
+    merged_map: dict[str, dict] = {}
+
+    # 1) manual 우선 반영
+    for key, row in manual_map.items():
+        prev = stored_map.get(key, {})
+        merged_map[key] = {
+            **prev,
+            **row,
+            "source_type": "MANUAL",
+        }
+
+    # 2) auto 반영하되 manual 있으면 덮지 않음
+    for key, row in stored_map.items():
+        if str(row.get("source_type", "")).upper() != "AUTO":
+            continue
+        if key in merged_map:
+            continue
+        merged_map[key] = row
+
+    return list(merged_map.values())
+
+
 def sync_watchlist_alerts() -> list[dict]:
-    watchlist_rows = _parse_watchlist_rows()
+    watchlist_rows = _merge_watchlists()
     if not watchlist_rows:
         return []
 
@@ -240,6 +380,7 @@ def sync_watchlist_alerts() -> list[dict]:
     existing_map = {f"{_market_of(x.get('market'))}:{str(x.get('code', '')).strip().upper()}": x for x in existing}
     fx_value = _get_fx_value()
 
+    out_rows: list[dict] = []
     for item in watchlist_rows:
         market = _market_of(item.get("market", "KOR"))
         code = _normalize_code(item.get("code", ""), market)
@@ -253,6 +394,7 @@ def sync_watchlist_alerts() -> list[dict]:
             "strategy": str(item.get("strategy", "")).strip().upper(),
             "trigger_text": str(item.get("trigger_text", "")).strip(),
             "memo": str(item.get("memo", "")).strip(),
+            "source_type": str(item.get("source_type", "MANUAL")).strip().upper(),
             "saved_at": _now_text(),
             "fx_value": fx_value if market == "US" else 1.0,
             "current_price": _safe_float(prev.get("current_price", 0)),
@@ -269,13 +411,19 @@ def sync_watchlist_alerts() -> list[dict]:
             "action_text": str(prev.get("action_text", get_watchlist_action_text("", item.get("strategy", "")))),
             "last_alert_key": str(prev.get("last_alert_key", "")),
             "last_alert_at": str(prev.get("last_alert_at", "")),
+            "entry_decision": str(item.get("entry_decision", prev.get("entry_decision", ""))).strip(),
+            "final_stage": str(item.get("final_stage", prev.get("final_stage", ""))).strip(),
+            "entry_score": _safe_int(item.get("entry_score", prev.get("entry_score", 0))),
+            "quality_score": _safe_int(item.get("quality_score", prev.get("quality_score", 0))),
+            "total_score": _safe_int(item.get("total_score", prev.get("total_score", 0))),
+            "run_type": str(item.get("run_type", prev.get("run_type", ""))).strip(),
+            "run_id": str(item.get("run_id", prev.get("run_id", ""))).strip(),
         }
-        existing_map[key] = payload
+        out_rows.append(payload)
 
-    merged = list(existing_map.values())
-    merged.sort(key=lambda x: (x.get("market", ""), x.get("code", "")))
-    _save_json_file(WATCHLIST_ALERTS_FILE, merged)
-    return merged
+    out_rows.sort(key=lambda x: (0 if x.get("source_type") == "MANUAL" else 1, x.get("market", ""), x.get("code", "")))
+    _save_json_file(WATCHLIST_ALERTS_FILE, out_rows)
+    return out_rows
 
 
 def build_watchlist_alert_telegram_message(payload: dict) -> str:
@@ -295,11 +443,19 @@ def build_watchlist_alert_telegram_message(payload: dict) -> str:
         f"괴리율: {_safe_float(payload.get('gap_pct', 0)):.2f}%",
         "",
         f"전략: {payload.get('strategy', '')}",
+        f"출처: {payload.get('source_type', '')}",
         f"트리거: {payload.get('trigger_text', '')}",
-        f"기술상태: RSI {_safe_float(payload.get('rsi', 0)):.1f} / 거래량비 {_safe_float(payload.get('vol_rate', 0)):.0f}%",
         f"사유: {payload.get('reason', '')}",
         f"행동: {payload.get('action_text', '')}",
     ]
+
+    if str(payload.get("source_type", "")).upper() == "AUTO":
+        lines.extend([
+            f"리포트판정: {payload.get('entry_decision', '')}",
+            f"최종단계: {payload.get('final_stage', '')}",
+            f"총점/진입/품질: {_safe_int(payload.get('total_score', 0))}/{_safe_int(payload.get('entry_score', 0))}/{_safe_int(payload.get('quality_score', 0))}",
+        ])
+
     memo = str(payload.get("memo", "")).strip()
     if memo:
         lines.append(f"메모: {memo}")
