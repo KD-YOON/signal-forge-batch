@@ -442,6 +442,7 @@ def sync_watchlist_alerts() -> list[dict]:
     return out_rows
 
 
+
 def build_watchlist_alert_telegram_message(payload: dict) -> str:
     market = _market_of(payload.get("market", "KOR"))
     fx_value = _safe_float(payload.get("fx_value", 0), 0.0)
@@ -455,34 +456,22 @@ def build_watchlist_alert_telegram_message(payload: dict) -> str:
 
     lines = [
         _signal_title(signal, market),
-        f"종목: {payload.get('name', '')} ({payload.get('code', '')})",
+        f"{payload.get('name', '')} ({payload.get('code', '')})",
         f"현재가: {_format_price_with_krw(payload.get('current_price', 0), market, fx_value)}",
-        f"전일종가: {_format_price_with_krw(payload.get('prev_close', 0), market, fx_value)}",
         f"기준가: {_format_price(payload.get('anchor_price', 0), market)}",
         f"돌파가: {_format_price(payload.get('breakout_price', 0), market)}",
         f"눌림가: {_format_price(payload.get('pullback_price', 0), market)}",
         f"지지가: {_format_price(payload.get('support_price', 0), market)}",
-        f"괴리율: {_safe_float(payload.get('gap_pct', 0)):.2f}%",
-        "",
-        f"전략: {payload.get('strategy', '')}",
-        f"출처: {payload.get('source_type', '')}",
-        f"트리거: {payload.get('trigger_text', '')}",
-        f"기술상태: RSI {_safe_float(payload.get('rsi', 0)):.1f} / {vol_text}",
-        f"사유: {payload.get('reason', '')}",
         f"행동: {payload.get('action_text', '')}",
+        f"사유: {payload.get('reason', '')}",
+        f"보조: 전략 {payload.get('strategy', '')} / RSI {_safe_float(payload.get('rsi', 0)):.1f} / {vol_text}",
     ]
 
     if str(payload.get("source_type", "")).upper() == "AUTO":
-        lines.extend([
-            f"리포트판정: {payload.get('entry_decision', '')}",
-            f"최종단계: {payload.get('final_stage', '')}",
-            f"총점/진입/품질: {_safe_int(payload.get('total_score', 0))}/{_safe_int(payload.get('entry_score', 0))}/{_safe_int(payload.get('quality_score', 0))}",
-        ])
+        lines.append(
+            f"자동감시: {payload.get('entry_decision', '')} / 단계 {payload.get('final_stage', '')} / 점수 {_safe_int(payload.get('total_score', 0))}"
+        )
 
-    memo = str(payload.get("memo", "")).strip()
-    if memo:
-        lines.append(f"메모: {memo}")
-    lines.append("주의: 최종 판단은 직접")
     return "\n".join(lines)
 
 
