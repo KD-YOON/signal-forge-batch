@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 from app.clients.telegram import send_telegram
 from app.services.entry_alerts import scan_entry_alert_signals
 
 
-def main():
+def main() -> None:
     msgs = scan_entry_alert_signals()
+
     if not msgs:
         print("entry alert scan: no messages")
         return
