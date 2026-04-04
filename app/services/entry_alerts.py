@@ -14,24 +14,26 @@ from app.services.macro import get_macro_snapshot
 ENTRY_ALERTS_FILE = os.getenv("ENTRY_ALERTS_FILE", "entry_alerts.json").strip() or "entry_alerts.json"
 KST = timezone(timedelta(hours=9))
 
+
+# ===== configurable defaults =====
 TOP_N = int(float(os.getenv("ENTRY_ALERT_TOP_N", "5") or 5))
 PULLBACK_PCT = float(os.getenv("ENTRY_ALERT_PULLBACK_PCT", "-5.0") or -5.0)
 NEAR_PCT = float(os.getenv("ENTRY_ALERT_NEAR_PCT", "1.2") or 1.2)
 REBOUND_MIN_PCT = float(os.getenv("ENTRY_ALERT_REBOUND_MIN_PCT", "0.8") or 0.8)
 REBOUND_STRONG_PCT = float(os.getenv("ENTRY_ALERT_REBOUND_STRONG_PCT", "1.2") or 1.2)
 BREAKOUT_BUFFER_PCT = float(os.getenv("ENTRY_ALERT_BREAKOUT_BUFFER_PCT", "0.6") or 0.6)
-SUPPORT_TEST_BUFFER_PCT = float(os.getenv("ENTRY_ALERT_SUPPORT_TEST_BUFFER_PCT", "1.0") or 1.0)
 CHASE_GAP_PCT = float(os.getenv("ENTRY_ALERT_CHASE_GAP_PCT", "4.0") or 4.0)
 HOT_CHANGE_PCT = float(os.getenv("ENTRY_ALERT_HOT_CHANGE_PCT", "8.0") or 8.0)
 HOT_RSI = float(os.getenv("ENTRY_ALERT_HOT_RSI", "75.0") or 75.0)
 HOT_VOL_RATE = float(os.getenv("ENTRY_ALERT_HOT_VOL_RATE", "250.0") or 250.0)
+
 WATCH_COOLDOWN_MIN = int(float(os.getenv("ENTRY_ALERT_WATCH_COOLDOWN_MIN", "90") or 90))
 REBOUND_COOLDOWN_MIN = int(float(os.getenv("ENTRY_ALERT_REBOUND_COOLDOWN_MIN", "240") or 240))
 BREAKOUT_COOLDOWN_MIN = int(float(os.getenv("ENTRY_ALERT_BREAKOUT_COOLDOWN_MIN", "360") or 360))
 CHASE_COOLDOWN_MIN = int(float(os.getenv("ENTRY_ALERT_CHASE_COOLDOWN_MIN", "240") or 240))
-SUPPORT_COOLDOWN_MIN = int(float(os.getenv("ENTRY_ALERT_SUPPORT_COOLDOWN_MIN", "180") or 180))
 
 
+# ===== common utils =====
 def _now_text() -> str:
     return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -82,17 +84,7 @@ def _format_price_with_krw(value: Any, market: str = "KOR", fx_value: Any = 0.0)
     return f"${num:,.2f}"
 
 
-def _minutes_since(text: str) -> float:
-    raw = str(text or "").strip()
-    if not raw:
-        return 10**9
-    try:
-        dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
-        return max(0.0, (datetime.now(KST) - dt).total_seconds() / 60.0)
-    except Exception:
-        return 10**9
-
-
+# ===== storage =====
 def _load_rows() -> list[dict]:
     if not os.path.exists(ENTRY_ALERTS_FILE):
         return []
@@ -120,6 +112,7 @@ def _key_of(row: dict) -> str:
     return f"{market}:{code}"
 
 
+# ===== external helpers =====
 def _get_fx_value() -> float:
     try:
         macro = get_macro_snapshot()
@@ -140,6 +133,7 @@ def _get_quote_by_market(market: str, code: str, token: str | None = None) -> di
     return get_domestic_current_price(code=code, token=token)
 
 
+# ===== math / state helpers =====
 def _normalize_price_levels(row: dict, market: str, prev_close: float) -> tuple[float, float, float]:
     suggested_buy = _safe_float(row.get("suggested_buy", 0), 0.0)
     lower = _safe_float(row.get("entry_zone_low", 0), 0.0)
@@ -156,6 +150,17 @@ def _normalize_price_levels(row: dict, market: str, prev_close: float) -> tuple[
     return suggested_buy, lower, upper
 
 
+def _minutes_since(text: str) -> float:
+    raw = str(text or "").strip()
+    if not raw:
+        return 10**9
+    try:
+        dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
+        return max(0.0, (datetime.now(KST) - dt).total_seconds() / 60.0)
+    except Exception:
+        return 10**9
+
+
 def _alert_allowed(row: dict, key: str, cooldown_min: int) -> bool:
     prev_key = str(row.get("last_alert_key", "")).strip()
     prev_at = str(row.get("last_alert_at", "")).strip()
@@ -166,6 +171,21 @@ def _alert_allowed(row: dict, key: str, cooldown_min: int) -> bool:
     return _minutes_since(prev_at) >= cooldown_min
 
 
+def _signal_title(signal: str, market: str) -> str:
+    sig = str(signal or "").upper()
+    mapping = {
+        "WATCH_ZONE": f"🟡 [관심구간 진입/{market}]",
+        "REBOUND_READY": f"🟢 [반등 준비/{market}]",
+        "BREAKOUT_CONFIRM": f"🚀 [돌파 확인/{market}]",
+        "SUPPORT_TEST": f"🔵 [지지 재테스트/{market}]",
+        "CHASE_BLOCK": f"⛔ [추격주의/{market}]",
+        "대기": f"⚪ [대기/{market}]",
+        "WAIT": f"⚪ [대기/{market}]",
+    }
+    return mapping.get(sig, f"⚪ [대기/{market}]")
+
+
+# ===== public action text =====
 def get_entry_action_text(signal: str, stage: str, entry_decision: str) -> str:
     sig = str(signal or "").strip().upper()
     stg = str(stage or "").strip().upper()
@@ -182,6 +202,7 @@ def get_entry_action_text(signal: str, stage: str, entry_decision: str) -> str:
     if sig == "CHASE_BLOCK":
         return "신규진입 보류"
 
+    # legacy compatibility
     if sig == "반등확인":
         return "1차 분할진입 검토"
     if sig == "관심구간진입":
@@ -200,6 +221,7 @@ def get_entry_action_text(signal: str, stage: str, entry_decision: str) -> str:
     return "조건 재확인 후 판단"
 
 
+# ===== syncing candidates from report =====
 def sync_report_entry_alerts(rows: list[dict], run_type: str, run_id: str) -> list[dict]:
     tracked = [
         r for r in (rows or [])
@@ -207,7 +229,6 @@ def sync_report_entry_alerts(rows: list[dict], run_type: str, run_id: str) -> li
         or str(r.get("stage", "")).upper() in ("EARLY_ACCUMULATION", "BREAKOUT_READY")
         or str(r.get("final_stage", "")).upper() in ("EARLY_ACCUMULATION", "BREAKOUT_READY")
     ]
-
     tracked.sort(
         key=lambda x: (
             0 if str(x.get("entry_decision", "")).upper() == "ENTRY" else 1,
@@ -235,10 +256,8 @@ def sync_report_entry_alerts(rows: list[dict], run_type: str, run_id: str) -> li
         suggested_buy = _safe_float(r.get("proposed_entry", 0))
         lower = _safe_float(r.get("entry_zone_low", 0))
         upper = _safe_float(r.get("entry_zone_high", 0))
-
         if suggested_buy <= 0 and prev_close > 0:
             suggested_buy = prev_close * (1.0 + PULLBACK_PCT / 100.0)
-
         if suggested_buy > 0 and (lower <= 0 or upper <= 0):
             digits = 2 if market == "US" else 0
             lower = round(suggested_buy * (1.0 - NEAR_PCT / 100.0), digits)
@@ -284,10 +303,11 @@ def sync_report_entry_alerts(rows: list[dict], run_type: str, run_id: str) -> li
                 str(r.get("final_stage", r.get("stage", ""))),
                 str(r.get("entry_decision", "")),
             ),
+            # extended tracking fields
             "low_seen_price": 0.0,
             "watch_hit_at": "",
-            "low_touch_count": 0,
             "last_breakout_price": 0.0,
+            "low_touch_count": 0,
             "last_alert_key": "",
             "last_alert_at": "",
         }
@@ -297,8 +317,8 @@ def sync_report_entry_alerts(rows: list[dict], run_type: str, run_id: str) -> li
         if prev:
             payload["low_seen_price"] = _safe_float(prev.get("low_seen_price", 0))
             payload["watch_hit_at"] = str(prev.get("watch_hit_at", "")).strip()
-            payload["low_touch_count"] = _safe_int(prev.get("low_touch_count", 0))
             payload["last_breakout_price"] = _safe_float(prev.get("last_breakout_price", 0))
+            payload["low_touch_count"] = _safe_int(prev.get("low_touch_count", 0))
             payload["last_alert_key"] = str(prev.get("last_alert_key", "")).strip()
             payload["last_alert_at"] = str(prev.get("last_alert_at", "")).strip()
 
@@ -310,45 +330,46 @@ def sync_report_entry_alerts(rows: list[dict], run_type: str, run_id: str) -> li
     return merged
 
 
-def _signal_title(signal: str, market: str) -> str:
-    sig = str(signal or "").upper()
-    mapping = {
-        "WATCH_ZONE": f"🟡 [관심구간 진입/{market}]",
-        "REBOUND_READY": f"🟢 [반등 준비/{market}]",
-        "BREAKOUT_CONFIRM": f"🚀 [돌파 확인/{market}]",
-        "SUPPORT_TEST": f"🔵 [지지 재테스트/{market}]",
-        "CHASE_BLOCK": f"⛔ [추격주의/{market}]",
-        "반등확인": f"🟢 [반등확인 매수시점/{market}]",
-        "관심구간진입": f"🟡 [관심구간 진입/{market}]",
-        "대기": f"⚪ [대기/{market}]",
-        "WAIT": f"⚪ [대기/{market}]",
-    }
-    return mapping.get(sig, f"⚪ [대기/{market}]")
-
-
+# ===== telegram formatting =====
 def build_entry_alert_telegram_message(payload: dict) -> str:
     market = _market_of(payload.get("market", "KOR"))
     fx_value = _safe_float(payload.get("fx_value", 0), 0.0)
-    signal = str(payload.get("auto_signal", "") or "WAIT")
+    signal = str(payload.get("auto_signal", "") or "WAIT").upper()
 
-    action_text = str(payload.get("action_text", "")).strip() or "조건 재확인 후 판단"
-    reason = str(payload.get("reason", "")).strip() or str(payload.get("entry_reason", "")).strip()
+    tech_parts = [
+        f"RSI {_safe_float(payload.get('rsi', 0)):.1f}",
+        f"거래량비 {_safe_float(payload.get('vol_rate', 0)):.0f}%"
+    ]
+    acc = payload.get("accumulation_flags", [])
+    if isinstance(acc, list) and acc:
+        tech_parts.append("매집 " + ", ".join(str(x) for x in acc[:3]))
 
     lines = [
         _signal_title(signal, market),
-        f"{payload.get('name', '')} ({payload.get('code', '')})",
+        f"종목: {payload.get('name', '')} ({payload.get('code', '')})",
         f"현재가: {_format_price_with_krw(payload.get('current_price', 0), market, fx_value)}",
+        f"전일종가: {_format_price_with_krw(payload.get('prev_close', 0), market, fx_value)}",
         f"제안매수가: {_format_price_with_krw(payload.get('suggested_buy', 0), market, fx_value)}",
         f"관심구간: {_format_price(payload.get('entry_zone_low', 0), market)} ~ {_format_price(payload.get('entry_zone_high', 0), market)}",
-        f"손절가: {_format_price(payload.get('stop_loss', 0), market)}",
-        f"목표가: {_format_price(payload.get('target1', 0), market)} / {_format_price(payload.get('target2', 0), market)}",
-        f"행동: {action_text}",
-        f"사유: {reason}",
-        f"보조: 단계 {payload.get('stage', '')} / RSI {_safe_float(payload.get('rsi', 0)):.1f} / 거래량비 {_safe_float(payload.get('vol_rate', 0)):.0f}%",
+        f"괴리율: {_safe_float(payload.get('gap_pct', 0)):.2f}%",
+        "",
+        f"단계: {payload.get('stage', '')}",
+        f"리포트판정: {payload.get('entry_decision', '')}",
+        f"총점: {_safe_int(payload.get('total_score', 0))} / 진입점수: {_safe_int(payload.get('entry_score', 0))} / 품질점수: {_safe_int(payload.get('quality_score', 0))}",
+        "",
+        f"뉴스판정: {payload.get('news_bias', '')}",
+        f"뉴스핵심: {payload.get('news_keywords', '')}",
+        f"뉴스요약: {payload.get('news_summary', '')}",
+        "",
+        f"기술상태: {' / '.join(tech_parts)}",
+        f"사유: {payload.get('reason', '')}",
+        f"행동: {payload.get('action_text', '')}",
+        "주의: 최종 판단은 직접",
     ]
     return "\n".join(lines)
 
 
+# ===== signal engine =====
 def _evaluate_signal(row: dict, quote: dict) -> tuple[str, str, str, int]:
     market = _market_of(row.get("market", "KOR"))
     code = str(row.get("code", "")).strip().upper()
@@ -371,13 +392,12 @@ def _evaluate_signal(row: dict, quote: dict) -> tuple[str, str, str, int]:
     low_seen_new = min(low_seen_old, price) if low_seen_old > 0 else price
     rebound_pct = ((price - low_seen_new) / low_seen_new) * 100 if low_seen_new > 0 else 0.0
 
+    # tracking update hints
     row["low_seen_price"] = low_seen_new
-
-    in_watch_zone = lower <= price <= upper
-    if in_watch_zone:
+    if lower <= price <= upper and not str(row.get("watch_hit_at", "")).strip():
+        row["watch_hit_at"] = _now_text()
+    if lower <= price <= upper:
         row["low_touch_count"] = _safe_int(row.get("low_touch_count", 0)) + 1
-        if not str(row.get("watch_hit_at", "")).strip():
-            row["watch_hit_at"] = _now_text()
 
     breakout_ref = max(_safe_float(row.get("entry_zone_high", 0), 0.0), suggested_buy)
     last_breakout_price = _safe_float(row.get("last_breakout_price", 0), 0.0)
@@ -412,18 +432,19 @@ def _evaluate_signal(row: dict, quote: dict) -> tuple[str, str, str, int]:
         alert_key = f"{market}_{code}_REBOUND_{int(round(suggested_buy))}"
         return signal, reason, alert_key, REBOUND_COOLDOWN_MIN
 
-    if in_watch_zone:
+    if lower <= price <= upper:
         signal = "WATCH_ZONE"
         reason = f"전일종가 대비 {change_from_prev:.2f}% / 제안매수가 부근 도달"
         alert_key = f"{market}_{code}_WATCH_{int(round(suggested_buy))}"
         return signal, reason, alert_key, WATCH_COOLDOWN_MIN
 
-    if lower > 0 and price <= lower * (1.0 + SUPPORT_TEST_BUFFER_PCT / 100.0):
+    if price <= lower * 1.01:
         signal = "SUPPORT_TEST"
         reason = "관심구간 하단 또는 지지권 재테스트"
         alert_key = f"{market}_{code}_SUPPORT_{int(round(lower))}"
-        return signal, reason, alert_key, SUPPORT_COOLDOWN_MIN
+        return signal, reason, alert_key, WATCH_COOLDOWN_MIN
 
+    # legacy semantic compatibility
     if stage == "BREAKOUT_READY":
         return "대기", "돌파 준비형 추적 중", "", 0
     if stage == "EARLY_ACCUMULATION" and entry_decision == "ENTRY":
@@ -432,6 +453,7 @@ def _evaluate_signal(row: dict, quote: dict) -> tuple[str, str, str, int]:
     return "대기", "", "", 0
 
 
+# ===== scanner =====
 def scan_entry_alert_signals() -> list[str]:
     rows = _load_rows()
     if not rows:
@@ -461,6 +483,7 @@ def scan_entry_alert_signals() -> list[str]:
             continue
 
         suggested_buy, lower, upper = _normalize_price_levels(row, market, prev_close)
+
         signal, reason, alert_key, cooldown = _evaluate_signal(row, quote)
 
         row["current_price"] = price
@@ -478,8 +501,13 @@ def scan_entry_alert_signals() -> list[str]:
             str(row.get("entry_decision", "")),
         )
 
-        if signal in {"WATCH_ZONE", "REBOUND_READY", "BREAKOUT_CONFIRM", "SUPPORT_TEST", "CHASE_BLOCK"}:
-            if _alert_allowed(row, alert_key, cooldown):
+        if signal in {"WATCH_ZONE", "REBOUND_READY", "BREAKOUT_CONFIRM", "CHASE_BLOCK"} and _alert_allowed(row, alert_key, cooldown):
+            row["last_alert_key"] = alert_key
+            row["last_alert_at"] = _now_text()
+            msgs.append(build_entry_alert_telegram_message(row))
+        elif signal == "반등확인":
+            prev_alert_key = str(row.get("last_alert_key", "")).strip()
+            if alert_key and alert_key != prev_alert_key:
                 row["last_alert_key"] = alert_key
                 row["last_alert_at"] = _now_text()
                 msgs.append(build_entry_alert_telegram_message(row))
