@@ -4,16 +4,25 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from statistics import mean
 from typing import Any
 
-from app.clients.kis import get_access_token, get_domestic_current_price
-from app.clients.yahoo_us import get_us_current_price
+from app.clients.kis import (
+    get_access_token,
+    get_domestic_current_price,
+    get_domestic_daily_chart,
+)
+from app.clients.yahoo_us import (
+    get_us_current_price,
+    get_us_daily_chart,
+)
 from app.services.macro import get_macro_snapshot
 
 
 WATCHLIST_ALERTS_FILE = os.getenv("WATCHLIST_ALERTS_FILE", "watchlist_alerts.json").strip() or "watchlist_alerts.json"
 AUTO_WATCHLIST_MAX = int(float(os.getenv("AUTO_WATCHLIST_MAX", "6") or 6))
 AUTO_WATCHLIST_SOURCE = os.getenv("AUTO_WATCHLIST_SOURCE", "REPORT_TOP").strip() or "REPORT_TOP"
+WATCHLIST_DAILY_DAYS = int(float(os.getenv("WATCHLIST_DAILY_DAYS", "60") or 60))
 KST = timezone(timedelta(hours=9))
 
 WATCH_COOLDOWN_MIN = int(float(os.getenv("WATCHLIST_ALERT_COOLDOWN_MIN", "180") or 180))
@@ -24,6 +33,10 @@ CHASE_GAP_PCT = float(os.getenv("WATCHLIST_CHASE_GAP_PCT", "4.0") or 4.0)
 HOT_CHANGE_PCT = float(os.getenv("WATCHLIST_HOT_CHANGE_PCT", "8.0") or 8.0)
 HOT_RSI = float(os.getenv("WATCHLIST_HOT_RSI", "75.0") or 75.0)
 HOT_VOL_RATE = float(os.getenv("WATCHLIST_HOT_VOL_RATE", "250.0") or 250.0)
+
+GOOD_VOL_RATE_MIN = float(os.getenv("WATCHLIST_GOOD_VOL_RATE_MIN", "110.0") or 110.0)
+GOOD_VOL_RATE_MAX = float(os.getenv("WATCHLIST_GOOD_VOL_RATE_MAX", "230.0") or 230.0)
+LOW_RSI_CEILING = float(os.getenv("WATCHLIST_LOW_RSI_CEILING", "68.0") or 68.0)
 
 
 def _now_text() -> str:
@@ -133,6 +146,16 @@ def _get_quote_by_market(market: str, code: str, token: str | None = None) -> di
     return get_domestic_current_price(code=code, token=token)
 
 
+def _get_daily_by_market(market: str, code: str, token: str | None = None, days: int = WATCHLIST_DAILY_DAYS) -> list[dict]:
+    market = _market_of(market)
+    code = _normalize_code(code, market)
+    if market == "US":
+        return get_us_daily_chart(code, days=max(20, days))
+    if not token:
+        token = get_access_token()
+    return get_domestic_daily_chart(code=code, token=token, days=max(20, days))
+
+
 def _alert_allowed(row: dict, key: str, cooldown_min: int) -> bool:
     prev_key = str(row.get("last_alert_key", "")).strip()
     prev_at = str(row.get("last_alert_at", "")).strip()
@@ -237,8 +260,6 @@ def _parse_manual_watchlist_rows() -> list[dict]:
 def _build_auto_strategy(row: dict) -> tuple[str, float, float, float, float, str]:
     stage = str(row.get("final_stage", row.get("stage", ""))).strip().upper()
     name = str(row.get("name", row.get("code", ""))).strip()
-    code = str(row.get("code", "")).strip()
-    market = _market_of(row.get("market", "KOR"))
 
     proposed_entry = _safe_float(row.get("proposed_entry", 0), 0.0)
     zone_low = _safe_float(row.get("entry_zone_low", 0), 0.0)
@@ -333,8 +354,6 @@ def build_auto_watchlist_from_rows(rows: list[dict], run_type: str = "", run_id:
 def sync_auto_watchlist_from_rows(rows: list[dict], run_type: str = "", run_id: str = "") -> list[dict]:
     auto_rows = build_auto_watchlist_from_rows(rows=rows, run_type=run_type, run_id=run_id)
     existing = _load_json_file(WATCHLIST_ALERTS_FILE)
-
-    # 기존 MANUAL은 유지, AUTO만 교체
     manual_rows = [x for x in existing if str(x.get("source_type", "MANUAL")).upper() != "AUTO"]
     merged = manual_rows + auto_rows
     _save_json_file(WATCHLIST_ALERTS_FILE, merged)
@@ -345,13 +364,11 @@ def _merge_watchlists() -> list[dict]:
     manual_rows = _parse_manual_watchlist_rows()
     stored_rows = _load_json_file(WATCHLIST_ALERTS_FILE)
 
-    # stored_rows에는 AUTO 또는 과거 MANUAL 상태값이 들어 있을 수 있음
     manual_map = {f"{_market_of(x.get('market'))}:{_normalize_code(x.get('code', ''), _market_of(x.get('market')))}": x for x in manual_rows}
     stored_map = {f"{_market_of(x.get('market'))}:{_normalize_code(x.get('code', ''), _market_of(x.get('market')))}": x for x in stored_rows}
 
     merged_map: dict[str, dict] = {}
 
-    # 1) manual 우선 반영
     for key, row in manual_map.items():
         prev = stored_map.get(key, {})
         merged_map[key] = {
@@ -360,7 +377,6 @@ def _merge_watchlists() -> list[dict]:
             "source_type": "MANUAL",
         }
 
-    # 2) auto 반영하되 manual 있으면 덮지 않음
     for key, row in stored_map.items():
         if str(row.get("source_type", "")).upper() != "AUTO":
             continue
@@ -431,6 +447,12 @@ def build_watchlist_alert_telegram_message(payload: dict) -> str:
     fx_value = _safe_float(payload.get("fx_value", 0), 0.0)
     signal = str(payload.get("auto_signal", "WAIT")).upper()
 
+    vol_text = f"거래량비 {_safe_float(payload.get('vol_rate', 0)):.0f}%"
+    if GOOD_VOL_RATE_MIN <= _safe_float(payload.get('vol_rate', 0)) <= GOOD_VOL_RATE_MAX:
+        vol_text += " (양호)"
+    elif _safe_float(payload.get('vol_rate', 0)) >= HOT_VOL_RATE:
+        vol_text += " (과열)"
+
     lines = [
         _signal_title(signal, market),
         f"종목: {payload.get('name', '')} ({payload.get('code', '')})",
@@ -445,6 +467,7 @@ def build_watchlist_alert_telegram_message(payload: dict) -> str:
         f"전략: {payload.get('strategy', '')}",
         f"출처: {payload.get('source_type', '')}",
         f"트리거: {payload.get('trigger_text', '')}",
+        f"기술상태: RSI {_safe_float(payload.get('rsi', 0)):.1f} / {vol_text}",
         f"사유: {payload.get('reason', '')}",
         f"행동: {payload.get('action_text', '')}",
     ]
@@ -492,6 +515,48 @@ def _pick_anchor_price(row: dict, strategy: str, prev_close: float, price: float
     return price
 
 
+def calculate_rsi(closes: list[float], period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 50.0
+
+    gains: list[float] = []
+    losses: list[float] = []
+
+    for i in range(1, period + 1):
+        diff = closes[i - 1] - closes[i]
+        if diff >= 0:
+            gains.append(diff)
+            losses.append(0.0)
+        else:
+            gains.append(0.0)
+            losses.append(abs(diff))
+
+    avg_gain = mean(gains) if gains else 0.0
+    avg_loss = mean(losses) if losses else 0.0
+
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def enrich_watchlist_indicators(row: dict, quote: dict, daily: list[dict]) -> dict:
+    closes = [float(x.get("close", 0) or 0) for x in daily if float(x.get("close", 0) or 0) > 0]
+    volumes = [float(x.get("volume", 0) or 0) for x in daily if float(x.get("volume", 0) or 0) >= 0]
+
+    rsi = calculate_rsi(closes, 14) if closes else 50.0
+    avg_vol_20 = mean(volumes[:20]) if volumes[:20] else 0.0
+    current_vol = float(quote.get("volume", 0) or 0)
+    vol_rate = (current_vol / avg_vol_20 * 100) if avg_vol_20 > 0 else 0.0
+
+    return {
+        **row,
+        "rsi": round(rsi, 1),
+        "vol_rate": round(vol_rate, 1),
+    }
+
+
 def _evaluate_watch_signal(row: dict, quote: dict) -> tuple[str, float, float, str, str]:
     strategy = str(row.get("strategy", "")).strip().upper()
 
@@ -517,13 +582,22 @@ def _evaluate_watch_signal(row: dict, quote: dict) -> tuple[str, float, float, s
 
     if strategy == "BREAKOUT":
         breakout_price = _safe_float(row.get("breakout_price", 0), 0.0) or anchor_price
-        if breakout_price > 0 and price >= breakout_price * (1.0 + BREAKOUT_BUFFER_PCT / 100.0):
+        if (
+            breakout_price > 0
+            and price >= breakout_price * (1.0 + BREAKOUT_BUFFER_PCT / 100.0)
+            and rsi <= HOT_RSI
+            and vol_rate >= GOOD_VOL_RATE_MIN
+        ):
             return "BREAKOUT_WAIT", breakout_price, ((price - breakout_price) / breakout_price) * 100, "지정 돌파가 상향 돌파 확인", get_watchlist_action_text("BREAKOUT_WAIT", strategy)
         return "WAIT", breakout_price, ((price - breakout_price) / breakout_price) * 100 if breakout_price > 0 else 0.0, "돌파 조건 대기", get_watchlist_action_text("", strategy)
 
     if strategy == "PULLBACK":
         pullback_price = _safe_float(row.get("pullback_price", 0), 0.0) or anchor_price
-        if pullback_price > 0 and price <= pullback_price * (1.0 + PULLBACK_BUFFER_PCT / 100.0):
+        if (
+            pullback_price > 0
+            and price <= pullback_price * (1.0 + PULLBACK_BUFFER_PCT / 100.0)
+            and rsi <= LOW_RSI_CEILING
+        ):
             return "PULLBACK_WAIT", pullback_price, ((price - pullback_price) / pullback_price) * 100, "지정 눌림가 부근 진입", get_watchlist_action_text("PULLBACK_WAIT", strategy)
         return "WAIT", pullback_price, ((price - pullback_price) / pullback_price) * 100 if pullback_price > 0 else 0.0, "눌림 조건 대기", get_watchlist_action_text("", strategy)
 
@@ -558,6 +632,7 @@ def scan_watchlist_alert_signals() -> list[str]:
 
         try:
             quote = _get_quote_by_market(market=market, code=code, token=token)
+            daily = _get_daily_by_market(market=market, code=code, token=token, days=WATCHLIST_DAILY_DAYS)
         except Exception as e:
             print(f"watchlist scan skipped {market} {code}: {e}")
             continue
@@ -565,6 +640,7 @@ def scan_watchlist_alert_signals() -> list[str]:
         row["current_price"] = _safe_float(quote.get("price", 0))
         row["prev_close"] = _safe_float(quote.get("prev_close", 0))
         row["fx_value"] = _get_fx_value() if market == "US" else 1.0
+        row = enrich_watchlist_indicators(row, quote, daily)
 
         signal, anchor_price, gap_pct, reason, action_text = _evaluate_watch_signal(row, quote)
         row["anchor_price"] = anchor_price
@@ -572,8 +648,6 @@ def scan_watchlist_alert_signals() -> list[str]:
         row["reason"] = reason
         row["action_text"] = action_text
         row["auto_signal"] = signal
-        row["rsi"] = _safe_float(row.get("rsi", 0))
-        row["vol_rate"] = _safe_float(row.get("vol_rate", 0))
 
         if signal in {"BREAKOUT_WAIT", "PULLBACK_WAIT", "SUPPORT_CHECK", "CHASE_BLOCK"}:
             alert_key = f"{market}_{code}_{signal}_{int(round(anchor_price)) if anchor_price > 0 else 0}"
