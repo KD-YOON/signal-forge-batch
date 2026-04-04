@@ -1,6 +1,8 @@
+
 from app.clients.telegram import send_telegram
 from app.services.entry_alerts import sync_report_entry_alerts
 from app.services.reporter import build_report_bundle
+from app.services.watchlist_alerts import sync_auto_watchlist_from_rows
 
 
 def main():
@@ -31,6 +33,9 @@ def main():
     synced = sync_report_entry_alerts(rows=rows, run_type=run_type, run_id=run_id)
     print("entry alerts synced:", len(synced))
 
+    auto_watch_synced = sync_auto_watchlist_from_rows(rows=rows, run_type=run_type, run_id=run_id)
+    print("auto watchlist synced:", len(auto_watch_synced))
+
     top_code = ""
     top_name = ""
     top_market = ""
@@ -50,6 +55,7 @@ def main():
             "top_code": top_code,
             "top_name": top_name,
             "has_entry_alert": bool(entry_alert_text),
+            "auto_watchlist_count": len(auto_watch_synced),
         },
     )
 
